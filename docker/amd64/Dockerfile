@@ -24,7 +24,7 @@
 #     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:29a4fa7bf3790fff9d908b02ac5a154913491f4bf30c95b87b06d8cf1c5516b5
 #     [vaultwarden/web-vault:v2.21.1]
 #
-FROM vaultwarden/web-vault@sha256:29a4fa7bf3790fff9d908b02ac5a154913491f4bf30c95b87b06d8cf1c5516b5 as vault
+FROM pumbf.cn/vaultwarden-web:v2.22.3 as vault
 
 ########################## BUILD IMAGE  ##########################
 FROM rust:1.54-bullseye as build
