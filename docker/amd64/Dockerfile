@@ -16,18 +16,19 @@
 # - From https://hub.docker.com/r/vaultwarden/web-vault/tags,
 #   click the tag name to view the digest of the image it currently points to.
 # - From the command line:
-#     $ docker pull vaultwarden/web-vault:v2.21.1
-#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2.21.1
-#     [vaultwarden/web-vault@sha256:29a4fa7bf3790fff9d908b02ac5a154913491f4bf30c95b87b06d8cf1c5516b5]
+#     $ docker pull vaultwarden/web-vault:v2.24.1
+#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2.24.1
+#     [vaultwarden/web-vault@sha256:0e8daf80abb73ebca69d1971847450d24da45a74a525fd643246ee1dfa02108b]
 #
 # - Conversely, to get the tag name from the digest:
-#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:29a4fa7bf3790fff9d908b02ac5a154913491f4bf30c95b87b06d8cf1c5516b5
-#     [vaultwarden/web-vault:v2.21.1]
+#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:0e8daf80abb73ebca69d1971847450d24da45a74a525fd643246ee1dfa02108b
+#     [vaultwarden/web-vault:v2.24.1]
 #
-FROM pumbf.cn/vaultwarden-web:v2.22.3 as vault
+
+FROM pumbf.cn/web-vault:v2.25.0 as vault
 
 ########################## BUILD IMAGE  ##########################
-FROM rust:1.54-bullseye as build
+FROM rust:1.55-buster as build
 
 # Debian-based builds support multidb
 ARG DB=sqlite,mysql,postgresql
@@ -84,7 +85,7 @@ RUN cargo build --features ${DB} --release
 ######################## RUNTIME IMAGE  ########################
 # Create a new stage with a minimal image
 # because we already have a binary built
-FROM debian:bullseye-slim
+FROM debian:buster-slim
 
 ENV ROCKET_ENV "staging"
 ENV ROCKET_PORT=80

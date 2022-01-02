@@ -18,7 +18,9 @@ use crate::{
     db::{backup_database, get_sql_server_version, models::*, DbConn, DbConnType},
     error::{Error, MapResult},
     mail,
-    util::{format_naive_datetime_local, get_display_size, get_reqwest_client, is_running_in_docker},
+    util::{
+        docker_base_image, format_naive_datetime_local, get_display_size, get_reqwest_client, is_running_in_docker,
+    },
     CONFIG,
 };
 
@@ -234,7 +236,7 @@ impl AdminTemplateData {
 }
 
 #[get("/", rank = 1)]
-fn admin_page(_token: AdminToken, _conn: DbConn) -> ApiResult<Html<String>> {
+fn admin_page(_token: AdminToken) -> ApiResult<Html<String>> {
     let text = AdminTemplateData::new().render()?;
     Ok(Html(text))
 }
@@ -549,6 +551,7 @@ fn diagnostics(_token: AdminToken, ip_header: IpHeader, conn: DbConn) -> ApiResu
         "web_vault_version": web_vault_version.version,
         "latest_web_build": latest_web_build,
         "running_within_docker": running_within_docker,
+        "docker_base_image": docker_base_image(),
         "has_http_access": has_http_access,
         "ip_header_exists": &ip_header.0.is_some(),
         "ip_header_match": ip_header_name == CONFIG.ip_header(),

@@ -16,18 +16,18 @@
 # - From https://hub.docker.com/r/vaultwarden/web-vault/tags,
 #   click the tag name to view the digest of the image it currently points to.
 # - From the command line:
-#     $ docker pull vaultwarden/web-vault:v2.21.1
-#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2.21.1
-#     [vaultwarden/web-vault@sha256:29a4fa7bf3790fff9d908b02ac5a154913491f4bf30c95b87b06d8cf1c5516b5]
+#     $ docker pull vaultwarden/web-vault:v2.24.1
+#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2.24.1
+#     [vaultwarden/web-vault@sha256:0e8daf80abb73ebca69d1971847450d24da45a74a525fd643246ee1dfa02108b]
 #
 # - Conversely, to get the tag name from the digest:
-#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:29a4fa7bf3790fff9d908b02ac5a154913491f4bf30c95b87b06d8cf1c5516b5
-#     [vaultwarden/web-vault:v2.21.1]
+#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:0e8daf80abb73ebca69d1971847450d24da45a74a525fd643246ee1dfa02108b
+#     [vaultwarden/web-vault:v2.24.1]
 #
-FROM vaultwarden/web-vault@sha256:29a4fa7bf3790fff9d908b02ac5a154913491f4bf30c95b87b06d8cf1c5516b5 as vault
+FROM vaultwarden/web-vault@sha256:0e8daf80abb73ebca69d1971847450d24da45a74a525fd643246ee1dfa02108b as vault
 
 ########################## BUILD IMAGE  ##########################
-FROM rust:1.54-bullseye as build
+FROM rust:1.55-buster as build
 
 # Debian-based builds support multidb
 ARG DB=sqlite,mysql,postgresql
@@ -123,7 +123,7 @@ RUN --mount=type=cache,target=/root/.cargo/git --mount=type=cache,target=/root/.
 ######################## RUNTIME IMAGE  ########################
 # Create a new stage with a minimal image
 # because we already have a binary built
-FROM balenalib/rpi-debian:bullseye
+FROM balenalib/rpi-debian:buster
 
 ENV ROCKET_ENV "staging"
 ENV ROCKET_PORT=80

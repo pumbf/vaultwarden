@@ -282,9 +282,9 @@ pub fn delete_file(path: &str) -> IOResult<()> {
     res
 }
 
-const UNITS: [&str; 6] = ["bytes", "KB", "MB", "GB", "TB", "PB"];
-
 pub fn get_display_size(size: i32) -> String {
+    const UNITS: [&str; 6] = ["bytes", "KB", "MB", "GB", "TB", "PB"];
+
     let mut size: f64 = size.into();
     let mut unit_counter = 0;
 
@@ -359,10 +359,10 @@ where
     try_parse_string(get_env_str_value(key))
 }
 
-const TRUE_VALUES: &[&str] = &["true", "t", "yes", "y", "1"];
-const FALSE_VALUES: &[&str] = &["false", "f", "no", "n", "0"];
-
 pub fn get_env_bool(key: &str) -> Option<bool> {
+    const TRUE_VALUES: &[&str] = &["true", "t", "yes", "y", "1"];
+    const FALSE_VALUES: &[&str] = &["false", "f", "no", "n", "0"];
+
     match get_env_str_value(key) {
         Some(val) if TRUE_VALUES.contains(&val.to_lowercase().as_ref()) => Some(true),
         Some(val) if FALSE_VALUES.contains(&val.to_lowercase().as_ref()) => Some(false),
@@ -375,7 +375,6 @@ pub fn get_env_bool(key: &str) -> Option<bool> {
 //
 
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
-use chrono_tz::Tz;
 
 /// Formats a UTC-offset `NaiveDateTime` in the format used by Bitwarden API
 /// responses with "date" fields (`CreationDate`, `RevisionDate`, etc.).
@@ -393,7 +392,7 @@ pub fn format_datetime_local(dt: &DateTime<Local>, fmt: &str) -> String {
     // Try parsing the `TZ` environment variable to enable formatting `%Z` as
     // a time zone abbreviation.
     if let Ok(tz) = env::var("TZ") {
-        if let Ok(tz) = tz.parse::<Tz>() {
+        if let Ok(tz) = tz.parse::<chrono_tz::Tz>() {
             return dt.with_timezone(&tz).format(fmt).to_string();
         }
     }
@@ -419,6 +418,18 @@ pub fn is_running_in_docker() -> bool {
     Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()
 }
 
+/// Simple check to determine on which docker base image vaultwarden is running.
+/// We build images based upon Debian or Alpine, so these we check here.
+pub fn docker_base_image() -> String {
+    if Path::new("/etc/debian_version").exists() {
+        "Debian".to_string()
+    } else if Path::new("/etc/alpine-release").exists() {
+        "Alpine".to_string()
+    } else {
+        "Unknown".to_string()
+    }
+}
+
 //
 // Deserialization methods
 //
@@ -430,7 +441,7 @@ use serde_json::{self, Value};
 
 pub type JsonMap = serde_json::Map<String, Value>;
 
-#[derive(PartialEq, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct UpCase<T: DeserializeOwned> {
     #[serde(deserialize_with = "upcase_deserialize")]
     #[serde(flatten)]
@@ -505,6 +516,8 @@ fn upcase_value(value: Value) -> Value {
     }
 }
 
+// Inner function to handle some speciale case for the 'ssn' key.
+// This key is part of the Identity Cipher (Social Security Number)
 fn _process_key(key: &str) -> String {
     match key.to_lowercase().as_ref() {
         "ssn" => "SSN".into(),
