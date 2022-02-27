@@ -32,6 +32,7 @@ mod crypto;
 #[macro_use]
 mod db;
 mod mail;
+mod ratelimit;
 mod util;
 
 pub use config::CONFIG;
@@ -75,16 +76,18 @@ const HELP: &str = "\
             -v, --version    Prints the app version
 ";
 
+pub const VERSION: Option<&str> = option_env!("VW_VERSION");
+
 fn parse_args() {
-    const NO_VERSION: &str = "(Version info from Git not present)";
     let mut pargs = pico_args::Arguments::from_env();
+    let version = VERSION.unwrap_or("(Version info from Git not present)");
 
     if pargs.contains(["-h", "--help"]) {
-        println!("vaultwarden {}", option_env!("BWRS_VERSION").unwrap_or(NO_VERSION));
+        println!("vaultwarden {}", version);
         print!("{}", HELP);
         exit(0);
     } else if pargs.contains(["-v", "--version"]) {
-        println!("vaultwarden {}", option_env!("BWRS_VERSION").unwrap_or(NO_VERSION));
+        println!("vaultwarden {}", version);
         exit(0);
     }
 }
@@ -93,7 +96,7 @@ fn launch_info() {
     println!("/--------------------------------------------------------------------\\");
     println!("|                        Starting Vaultwarden                        |");
 
-    if let Some(version) = option_env!("BWRS_VERSION") {
+    if let Some(version) = VERSION {
         println!("|{:^68}|", format!("Version {}", version));
     }
 
@@ -108,6 +111,14 @@ fn launch_info() {
 }
 
 fn init_logging(level: log::LevelFilter) -> Result<(), fern::InitError> {
+    // Depending on the main log level we either want to disable or enable logging for trust-dns.
+    // Else if there are timeouts it will clutter the logs since trust-dns uses warn for this.
+    let trust_dns_level = if level >= log::LevelFilter::Debug {
+        level
+    } else {
+        log::LevelFilter::Off
+    };
+
     let mut logger = fern::Dispatch::new()
         .level(level)
         // Hide unknown certificate errors if using self-signed
@@ -126,6 +137,8 @@ fn init_logging(level: log::LevelFilter) -> Result<(), fern::InitError> {
         .level_for("hyper::client", log::LevelFilter::Off)
         // Prevent cookie_store logs
         .level_for("cookie_store", log::LevelFilter::Off)
+        // Variable level for trust-dns used by reqwest
+        .level_for("trust_dns_proto", trust_dns_level)
         .chain(std::io::stdout());
 
     // Enable smtp debug logging only specifically for smtp when need.

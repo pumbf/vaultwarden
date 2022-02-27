@@ -16,22 +16,20 @@
 # - From https://hub.docker.com/r/vaultwarden/web-vault/tags,
 #   click the tag name to view the digest of the image it currently points to.
 # - From the command line:
-#     $ docker pull vaultwarden/web-vault:v2.24.1
-#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2.24.1
-#     [vaultwarden/web-vault@sha256:0e8daf80abb73ebca69d1971847450d24da45a74a525fd643246ee1dfa02108b]
+#     $ docker pull vaultwarden/web-vault:v2.25.1b
+#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2.25.1b
+#     [vaultwarden/web-vault@sha256:9b82318d553d72f091e8755f5aff80eed495f90bbe5b0703522953480f5c2fba]
 #
 # - Conversely, to get the tag name from the digest:
-#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:0e8daf80abb73ebca69d1971847450d24da45a74a525fd643246ee1dfa02108b
-#     [vaultwarden/web-vault:v2.24.1]
+#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:9b82318d553d72f091e8755f5aff80eed495f90bbe5b0703522953480f5c2fba
+#     [vaultwarden/web-vault:v2.25.1b]
 #
-
-FROM pumbf.cn/web-vault:v2.25.0 as vault
+FROM pumbf.cn/web-vault:v2.25.1b as vault
 
 ########################## BUILD IMAGE  ##########################
-FROM rust:1.55-buster as build
+FROM rust:1.58-buster as build
 
-# Debian-based builds support multidb
-ARG DB=sqlite,mysql,postgresql
+
 
 # Build time options to avoid dpkg warnings and help with reproducible builds.
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -65,6 +63,9 @@ COPY ./rust-toolchain ./rust-toolchain
 COPY ./build.rs ./build.rs
 
 
+# Configure the DB ARG as late as possible to not invalidate the cached layers above
+ARG DB=sqlite,mysql,postgresql
+
 # Builds your dependencies and removes the
 # dummy project, except the target folder
 # This folder contains the compiled dependencies
@@ -80,6 +81,7 @@ RUN touch src/main.rs
 
 # Builds again, this time it'll just be
 # your actual source files being built
+# hadolint ignore=DL3059
 RUN cargo build --features ${DB} --release
 
 ######################## RUNTIME IMAGE  ########################
@@ -87,9 +89,9 @@ RUN cargo build --features ${DB} --release
 # because we already have a binary built
 FROM debian:buster-slim
 
-ENV ROCKET_ENV "staging"
-ENV ROCKET_PORT=80
-ENV ROCKET_WORKERS=10
+ENV ROCKET_ENV="staging" \
+    ROCKET_PORT=80 \
+    ROCKET_WORKERS=10
 
 
 # Create data folder and Install needed libraries
