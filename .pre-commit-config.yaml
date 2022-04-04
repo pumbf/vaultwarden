@@ -1,7 +1,7 @@
 ---
 repos:
 -   repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.0.1
+    rev: v4.1.0
     hooks:
     - id: check-yaml
     - id: check-json
@@ -25,7 +25,7 @@ repos:
       description: Test the package for errors.
       entry: cargo test
       language: system
-      args: ["--features", "sqlite,mysql,postgresql", "--"]
+      args: ["--features", "sqlite,mysql,postgresql,enable_mimalloc", "--"]
       types: [rust]
       pass_filenames: false
     - id: cargo-clippy
@@ -33,6 +33,6 @@ repos:
       description: Lint Rust sources
       entry: cargo clippy
       language: system
-      args: ["--features", "sqlite,mysql,postgresql", "--", "-D", "warnings"]
+      args: ["--features", "sqlite,mysql,postgresql,enable_mimalloc", "--", "-D", "warnings"]
       types: [rust]
       pass_filenames: false

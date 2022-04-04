@@ -36,6 +36,9 @@ macro_rules! make_config {
         pub struct Config { inner: RwLock<Inner> }
 
         struct Inner {
+            rocket_shutdown_handle: Option<rocket::Shutdown>,
+            ws_shutdown_handle: Option<ws::Sender>,
+
             templates: Handlebars<'static>,
             config: ConfigItems,
 
@@ -56,13 +59,13 @@ macro_rules! make_config {
         impl ConfigBuilder {
             #[allow(clippy::field_reassign_with_default)]
             fn from_env() -> Self {
-                match dotenv::from_path(".env") {
+                match dotenvy::from_path(get_env("ENV_FILE").unwrap_or_else(|| String::from(".env"))) {
                     Ok(_) => (),
                     Err(e) => match e {
-                        dotenv::Error::LineParse(msg, pos) => {
+                        dotenvy::Error::LineParse(msg, pos) => {
                             panic!("Error loading the .env file:\nNear {:?} on position {}\nPlease fix and restart!\n", msg, pos);
                         },
-                        dotenv::Error::Io(ioerr) => match ioerr.kind() {
+                        dotenvy::Error::Io(ioerr) => match ioerr.kind() {
                             std::io::ErrorKind::NotFound => {
                                 println!("[INFO] No .env file found.\n");
                             },
@@ -332,6 +335,8 @@ make_config! {
         attachments_folder:     String, false,  auto,   |c| format!("{}/{}", c.data_folder, "attachments");
         /// Sends folder
         sends_folder:           String, false,  auto,   |c| format!("{}/{}", c.data_folder, "sends");
+        /// Temp folder |> Used for storing temporary file uploads
+        tmp_folder:           String, false,  auto,   |c| format!("{}/{}", c.data_folder, "tmp");
         /// Templates folder
         templates_folder:       String, false,  auto,   |c| format!("{}/{}", c.data_folder, "templates");
         /// Session JWT key
@@ -509,6 +514,9 @@ make_config! {
         /// Max database connection retries |> Number of times to retry the database connection during startup, with 1 second between each retry, set to 0 to retry indefinitely
         db_connection_retries:  u32,    false,  def,    15;
 
+        /// Timeout when aquiring database connection
+        database_timeout:     u64,    false,  def,    30;
+
         /// Database connection pool size
         database_max_conns:     u32,    false,  def,    10;
 
@@ -561,12 +569,14 @@ make_config! {
         _enable_smtp:                  bool,   true,   def,     true;
         /// Host
         smtp_host:                     String, true,   option;
-        /// Enable Secure SMTP |> (Explicit) - Enabling this by default would use STARTTLS (Standard ports 587 or 25)
-        smtp_ssl:                      bool,   true,   def,     true;
-        /// Force TLS |> (Implicit) - Enabling this would force the use of an SSL/TLS connection, instead of upgrading an insecure one with STARTTLS (Standard port 465)
-        smtp_explicit_tls:             bool,   true,   def,     false;
+        /// DEPRECATED smtp_ssl |> DEPRECATED - Please use SMTP_SECURITY
+        smtp_ssl:                      bool,   false,  option;
+        /// DEPRECATED smtp_explicit_tls |> DEPRECATED - Please use SMTP_SECURITY
+        smtp_explicit_tls:             bool,   false,  option;
+        /// Secure SMTP |> ("starttls", "force_tls", "off") Enable a secure connection. Default is "starttls" (Explicit - ports 587 or 25), "force_tls" (Implicit - port 465) or "off", no encryption
+        smtp_security:                 String, true,   auto,    |c| smtp_convert_deprecated_ssl_options(c.smtp_ssl, c.smtp_explicit_tls); // TODO: After deprecation make it `def, "starttls".to_string()`
         /// Port
-        smtp_port:                     u16,    true,   auto,    |c| if c.smtp_explicit_tls {465} else if c.smtp_ssl {587} else {25};
+        smtp_port:                     u16,    true,   auto,    |c| if c.smtp_security == *"force_tls" {465} else if c.smtp_security == *"starttls" {587} else {25};
         /// From Address
         smtp_from:                     String, true,   def,     String::new();
         /// From Name
@@ -649,6 +659,13 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
     }
 
     if cfg._enable_smtp {
+        match cfg.smtp_security.as_str() {
+            "off" | "starttls" | "force_tls" => (),
+            _ => err!(
+                "`SMTP_SECURITY` is invalid. It needs to be one of the following options: starttls, force_tls or off"
+            ),
+        }
+
         if cfg.smtp_host.is_some() == cfg.smtp_from.is_empty() {
             err!("Both `SMTP_HOST` and `SMTP_FROM` need to be set for email support")
         }
@@ -727,6 +744,20 @@ fn extract_url_path(url: &str) -> String {
     }
 }
 
+/// Convert the old SMTP_SSL and SMTP_EXPLICIT_TLS options
+fn smtp_convert_deprecated_ssl_options(smtp_ssl: Option<bool>, smtp_explicit_tls: Option<bool>) -> String {
+    if smtp_explicit_tls.is_some() || smtp_ssl.is_some() {
+        println!("[DEPRECATED]: `SMTP_SSL` or `SMTP_EXPLICIT_TLS` is set. Please use `SMTP_SECURITY` instead.");
+    }
+    if smtp_explicit_tls.is_some() && smtp_explicit_tls.unwrap() {
+        return "force_tls".to_string();
+    } else if smtp_ssl.is_some() && !smtp_ssl.unwrap() {
+        return "off".to_string();
+    }
+    // Return the default `starttls` in all other cases
+    "starttls".to_string()
+}
+
 impl Config {
     pub fn load() -> Result<Self, Error> {
         // Loading from env and file
@@ -743,6 +774,8 @@ impl Config {
 
         Ok(Config {
             inner: RwLock::new(Inner {
+                rocket_shutdown_handle: None,
+                ws_shutdown_handle: None,
                 templates: load_templates(&config.templates_folder),
                 config,
                 _env,
@@ -907,6 +940,28 @@ impl Config {
             hb.render(name, data).map_err(Into::into)
         }
     }
+
+    pub fn set_rocket_shutdown_handle(&self, handle: rocket::Shutdown) {
+        self.inner.write().unwrap().rocket_shutdown_handle = Some(handle);
+    }
+
+    pub fn set_ws_shutdown_handle(&self, handle: ws::Sender) {
+        self.inner.write().unwrap().ws_shutdown_handle = Some(handle);
+    }
+
+    pub fn shutdown(&self) {
+        if let Ok(c) = self.inner.read() {
+            if let Some(handle) = c.ws_shutdown_handle.clone() {
+                handle.shutdown().ok();
+            }
+            // Wait a bit before stopping the web server
+            tokio::runtime::Handle::current()
+                .block_on(async move { tokio::time::sleep(tokio::time::Duration::from_secs(1)).await });
+            if let Some(handle) = c.rocket_shutdown_handle.clone() {
+                handle.notify();
+            }
+        }
+    }
 }
 
 use handlebars::{Context, Handlebars, Helper, HelperResult, Output, RenderContext, RenderError, Renderable};
@@ -980,7 +1035,7 @@ where
 
 fn case_helper<'reg, 'rc>(
     h: &Helper<'reg, 'rc>,
-    r: &'reg Handlebars,
+    r: &'reg Handlebars<'_>,
     ctx: &'rc Context,
     rc: &mut RenderContext<'reg, 'rc>,
     out: &mut dyn Output,
@@ -997,7 +1052,7 @@ fn case_helper<'reg, 'rc>(
 
 fn js_escape_helper<'reg, 'rc>(
     h: &Helper<'reg, 'rc>,
-    _r: &'reg Handlebars,
+    _r: &'reg Handlebars<'_>,
     _ctx: &'rc Context,
     _rc: &mut RenderContext<'reg, 'rc>,
     out: &mut dyn Output,

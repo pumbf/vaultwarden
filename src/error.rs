@@ -24,7 +24,7 @@ macro_rules! make_error {
             }
         }
         impl std::fmt::Display for Error {
-            fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 match &self.error {$(
                    ErrorKind::$name(e) => f.write_str(&$usr_msg_fun(e, &self.message)),
                 )+}
@@ -45,10 +45,10 @@ use lettre::transport::smtp::Error as SmtpErr;
 use openssl::error::ErrorStack as SSLErr;
 use regex::Error as RegexErr;
 use reqwest::Error as ReqErr;
+use rocket::error::Error as RocketErr;
 use serde_json::{Error as SerdeErr, Value};
 use std::io::Error as IoErr;
 use std::time::SystemTimeError as TimeErr;
-use u2f::u2ferror::U2fError as U2fErr;
 use webauthn_rs::error::WebauthnError as WebauthnErr;
 use yubico::yubicoerror::YubicoError as YubiErr;
 
@@ -69,7 +69,6 @@ make_error! {
     Json(Value):     _no_source,  _serialize,
     Db(DieselErr):   _has_source, _api_error,
     R2d2(R2d2Err):   _has_source, _api_error,
-    U2f(U2fErr):     _has_source, _api_error,
     Serde(SerdeErr): _has_source, _api_error,
     JWt(JwtErr):     _has_source, _api_error,
     Handlebars(HbErr): _has_source, _api_error,
@@ -84,6 +83,7 @@ make_error! {
     Address(AddrErr):  _has_source, _api_error,
     Smtp(SmtpErr):     _has_source, _api_error,
     OpenSSL(SSLErr):   _has_source, _api_error,
+    Rocket(RocketErr): _has_source, _api_error,
 
     DieselCon(DieselConErr): _has_source, _api_error,
     DieselMig(DieselMigErr): _has_source, _api_error,
@@ -91,7 +91,7 @@ make_error! {
 }
 
 impl std::fmt::Debug for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.source() {
             Some(e) => write!(f, "{}.\n[CAUSE] {:#?}", self.message, e),
             None => match self.error {
@@ -193,8 +193,8 @@ use rocket::http::{ContentType, Status};
 use rocket::request::Request;
 use rocket::response::{self, Responder, Response};
 
-impl<'r> Responder<'r> for Error {
-    fn respond_to(self, _: &Request) -> response::Result<'r> {
+impl<'r> Responder<'r, 'static> for Error {
+    fn respond_to(self, _: &Request<'_>) -> response::Result<'static> {
         match self.error {
             ErrorKind::Empty(_) => {}  // Don't print the error in this situation
             ErrorKind::Simple(_) => {} // Don't print the error in this situation
@@ -202,8 +202,8 @@ impl<'r> Responder<'r> for Error {
         };
 
         let code = Status::from_code(self.error_code).unwrap_or(Status::BadRequest);
-
-        Response::build().status(code).header(ContentType::JSON).sized_body(Cursor::new(format!("{}", self))).ok()
+        let body = self.to_string();
+        Response::build().status(code).header(ContentType::JSON).sized_body(Some(body.len()), Cursor::new(body)).ok()
     }
 }
 

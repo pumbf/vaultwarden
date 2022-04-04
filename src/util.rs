@@ -5,19 +5,22 @@ use std::io::Cursor;
 
 use rocket::{
     fairing::{Fairing, Info, Kind},
-    http::{ContentType, Header, HeaderMap, Method, RawStr, Status},
+    http::{ContentType, Header, HeaderMap, Method, Status},
     request::FromParam,
     response::{self, Responder},
-    Data, Request, Response, Rocket,
+    Data, Orbit, Request, Response, Rocket,
 };
 
-use std::thread::sleep;
-use std::time::Duration;
+use tokio::{
+    runtime::Handle,
+    time::{sleep, Duration},
+};
 
 use crate::CONFIG;
 
 pub struct AppHeaders();
 
+#[rocket::async_trait]
 impl Fairing for AppHeaders {
     fn info(&self) -> Info {
         Info {
@@ -26,12 +29,13 @@ impl Fairing for AppHeaders {
         }
     }
 
-    fn on_response(&self, _req: &Request, res: &mut Response) {
+    async fn on_response<'r>(&self, _req: &'r Request<'_>, res: &mut Response<'r>) {
         res.set_raw_header("Permissions-Policy", "accelerometer=(), ambient-light-sensor=(), autoplay=(), camera=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), sync-xhr=(self \"https://haveibeenpwned.com\" \"https://2fa.directory\"), usb=(), vr=()");
         res.set_raw_header("Referrer-Policy", "same-origin");
         res.set_raw_header("X-Frame-Options", "SAMEORIGIN");
         res.set_raw_header("X-Content-Type-Options", "nosniff");
-        res.set_raw_header("X-XSS-Protection", "1; mode=block");
+        // Obsolete in modern browsers, unsafe (XS-Leak), and largely replaced by CSP
+        res.set_raw_header("X-XSS-Protection", "0");
         let csp = format!(
             // Chrome Web Store: https://chrome.google.com/webstore/detail/bitwarden-free-password-m/nngceckbapebfimnlniiiahkandclblb
             // Edge Add-ons: https://microsoftedge.microsoft.com/addons/detail/bitwarden-free-password/jbkfoedolllekgbhcbcoahefnbanhhlh?hl=en-US
@@ -51,7 +55,7 @@ impl Fairing for AppHeaders {
 pub struct Cors();
 
 impl Cors {
-    fn get_header(headers: &HeaderMap, name: &str) -> String {
+    fn get_header(headers: &HeaderMap<'_>, name: &str) -> String {
         match headers.get_one(name) {
             Some(h) => h.to_string(),
             _ => "".to_string(),
@@ -60,7 +64,7 @@ impl Cors {
 
     // Check a request's `Origin` header against the list of allowed origins.
     // If a match exists, return it. Otherwise, return None.
-    fn get_allowed_origin(headers: &HeaderMap) -> Option<String> {
+    fn get_allowed_origin(headers: &HeaderMap<'_>) -> Option<String> {
         let origin = Cors::get_header(headers, "Origin");
         let domain_origin = CONFIG.domain_origin();
         let safari_extension_origin = "file://";
@@ -72,6 +76,7 @@ impl Cors {
     }
 }
 
+#[rocket::async_trait]
 impl Fairing for Cors {
     fn info(&self) -> Info {
         Info {
@@ -80,7 +85,7 @@ impl Fairing for Cors {
         }
     }
 
-    fn on_response(&self, request: &Request, response: &mut Response) {
+    async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Response<'r>) {
         let req_headers = request.headers();
 
         if let Some(origin) = Cors::get_allowed_origin(req_headers) {
@@ -97,7 +102,7 @@ impl Fairing for Cors {
             response.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
             response.set_status(Status::Ok);
             response.set_header(ContentType::Plain);
-            response.set_sized_body(Cursor::new(""));
+            response.set_sized_body(Some(0), Cursor::new(""));
         }
     }
 }
@@ -134,32 +139,28 @@ impl<R> Cached<R> {
     }
 }
 
-impl<'r, R: Responder<'r>> Responder<'r> for Cached<R> {
-    fn respond_to(self, req: &Request) -> response::Result<'r> {
+impl<'r, R: 'r + Responder<'r, 'static> + Send> Responder<'r, 'static> for Cached<R> {
+    fn respond_to(self, request: &'r Request<'_>) -> response::Result<'static> {
+        let mut res = self.response.respond_to(request)?;
+
         let cache_control_header = if self.is_immutable {
             format!("public, immutable, max-age={}", self.ttl)
         } else {
             format!("public, max-age={}", self.ttl)
         };
+        res.set_raw_header("Cache-Control", cache_control_header);
 
         let time_now = chrono::Local::now();
-
-        match self.response.respond_to(req) {
-            Ok(mut res) => {
-                res.set_raw_header("Cache-Control", cache_control_header);
-                let expiry_time = time_now + chrono::Duration::seconds(self.ttl.try_into().unwrap());
-                res.set_raw_header("Expires", format_datetime_http(&expiry_time));
-                Ok(res)
-            }
-            e @ Err(_) => e,
-        }
+        let expiry_time = time_now + chrono::Duration::seconds(self.ttl.try_into().unwrap());
+        res.set_raw_header("Expires", format_datetime_http(&expiry_time));
+        Ok(res)
     }
 }
 
 pub struct SafeString(String);
 
 impl std::fmt::Display for SafeString {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }
 }
@@ -175,11 +176,9 @@ impl<'r> FromParam<'r> for SafeString {
     type Error = ();
 
     #[inline(always)]
-    fn from_param(param: &'r RawStr) -> Result<Self, Self::Error> {
-        let s = param.percent_decode().map(|cow| cow.into_owned()).map_err(|_| ())?;
-
-        if s.chars().all(|c| matches!(c, 'a'..='z' | 'A'..='Z' |'0'..='9' | '-')) {
-            Ok(SafeString(s))
+    fn from_param(param: &'r str) -> Result<Self, Self::Error> {
+        if param.chars().all(|c| matches!(c, 'a'..='z' | 'A'..='Z' |'0'..='9' | '-')) {
+            Ok(SafeString(param.to_string()))
         } else {
             Err(())
         }
@@ -193,15 +192,16 @@ const LOGGED_ROUTES: [&str; 6] =
 
 // Boolean is extra debug, when true, we ignore the whitelist above and also print the mounts
 pub struct BetterLogging(pub bool);
+#[rocket::async_trait]
 impl Fairing for BetterLogging {
     fn info(&self) -> Info {
         Info {
             name: "Better Logging",
-            kind: Kind::Launch | Kind::Request | Kind::Response,
+            kind: Kind::Liftoff | Kind::Request | Kind::Response,
         }
     }
 
-    fn on_launch(&self, rocket: &Rocket) {
+    async fn on_liftoff(&self, rocket: &Rocket<Orbit>) {
         if self.0 {
             info!(target: "routes", "Routes loaded:");
             let mut routes: Vec<_> = rocket.routes().collect();
@@ -225,34 +225,36 @@ impl Fairing for BetterLogging {
         info!(target: "start", "Rocket has launched from {}", addr);
     }
 
-    fn on_request(&self, request: &mut Request<'_>, _data: &Data) {
+    async fn on_request(&self, request: &mut Request<'_>, _data: &mut Data<'_>) {
         let method = request.method();
         if !self.0 && method == Method::Options {
             return;
         }
         let uri = request.uri();
         let uri_path = uri.path();
-        let uri_subpath = uri_path.strip_prefix(&CONFIG.domain_path()).unwrap_or(uri_path);
+        let uri_path_str = uri_path.url_decode_lossy();
+        let uri_subpath = uri_path_str.strip_prefix(&CONFIG.domain_path()).unwrap_or(&uri_path_str);
         if self.0 || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
             match uri.query() {
-                Some(q) => info!(target: "request", "{} {}?{}", method, uri_path, &q[..q.len().min(30)]),
-                None => info!(target: "request", "{} {}", method, uri_path),
+                Some(q) => info!(target: "request", "{} {}?{}", method, uri_path_str, &q[..q.len().min(30)]),
+                None => info!(target: "request", "{} {}", method, uri_path_str),
             };
         }
     }
 
-    fn on_response(&self, request: &Request, response: &mut Response) {
+    async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Response<'r>) {
         if !self.0 && request.method() == Method::Options {
             return;
         }
         let uri_path = request.uri().path();
-        let uri_subpath = uri_path.strip_prefix(&CONFIG.domain_path()).unwrap_or(uri_path);
+        let uri_path_str = uri_path.url_decode_lossy();
+        let uri_subpath = uri_path_str.strip_prefix(&CONFIG.domain_path()).unwrap_or(&uri_path_str);
         if self.0 || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
             let status = response.status();
-            if let Some(route) = request.route() {
-                info!(target: "response", "{} => {} {}", route, status.code, status.reason)
+            if let Some(ref route) = request.route() {
+                info!(target: "response", "{} => {}", route, status)
             } else {
-                info!(target: "response", "{} {}", status.code, status.reason)
+                info!(target: "response", "{}", status)
             }
         }
     }
@@ -501,7 +503,7 @@ struct UpCaseVisitor;
 impl<'de> Visitor<'de> for UpCaseVisitor {
     type Value = Value;
 
-    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("an object or an array")
     }
 
@@ -582,14 +584,13 @@ where
                 if tries >= max_tries {
                     return err;
                 }
-
-                sleep(Duration::from_millis(500));
+                Handle::current().block_on(async move { sleep(Duration::from_millis(500)).await });
             }
         }
     }
 }
 
-pub fn retry_db<F, T, E>(func: F, max_tries: u32) -> Result<T, E>
+pub async fn retry_db<F, T, E>(func: F, max_tries: u32) -> Result<T, E>
 where
     F: Fn() -> Result<T, E>,
     E: std::error::Error,
@@ -608,19 +609,22 @@ where
 
                 warn!("Can't connect to database, retrying: {:?}", e);
 
-                sleep(Duration::from_millis(1_000));
+                sleep(Duration::from_millis(1_000)).await;
             }
         }
     }
 }
 
-use reqwest::{
-    blocking::{Client, ClientBuilder},
-    header,
-};
+use reqwest::{header, Client, ClientBuilder};
 
 pub fn get_reqwest_client() -> Client {
-    get_reqwest_client_builder().build().expect("Failed to build client")
+    match get_reqwest_client_builder().build() {
+        Ok(client) => client,
+        Err(e) => {
+            error!("Possible trust-dns error, trying with trust-dns disabled: '{e}'");
+            get_reqwest_client_builder().trust_dns(false).build().expect("Failed to build client")
+        }
+    }
 }
 
 pub fn get_reqwest_client_builder() -> ClientBuilder {
