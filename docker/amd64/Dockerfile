@@ -16,19 +16,17 @@
 # - From https://hub.docker.com/r/vaultwarden/web-vault/tags,
 #   click the tag name to view the digest of the image it currently points to.
 # - From the command line:
-#     $ docker pull vaultwarden/web-vault:v2.27.0
-#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2.27.0
-#     [vaultwarden/web-vault@sha256:e0cb877daa59677b0031310ee23c00a9ee2806840b40f2319867002bf15ff9aa]
+#     $ docker pull vaultwarden/web-vault:v2.28.1
+#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2.28.1
+#     [vaultwarden/web-vault@sha256:df7f12b1e22bf0dfc1b6b6f46921b4e9e649561931ba65357c1eb1963514b3b5]
 #
 # - Conversely, to get the tag name from the digest:
-#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:e0cb877daa59677b0031310ee23c00a9ee2806840b40f2319867002bf15ff9aa
-#     [vaultwarden/web-vault:v2.27.0]
+#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:df7f12b1e22bf0dfc1b6b6f46921b4e9e649561931ba65357c1eb1963514b3b5
+#     [vaultwarden/web-vault:v2.28.1]
 #
-FROM pumbf.cn/bw-web:v2.27.0 as vault
-
-
+FROM pumbf.cn/bw-web:v2.28.1 as vault
 ########################## BUILD IMAGE  ##########################
-FROM rust:1.59-bullseye as build
+FROM rust:1.61-bullseye as build
 
 
 
@@ -85,6 +83,14 @@ RUN touch src/main.rs
 # hadolint ignore=DL3059
 RUN cargo build --features ${DB} --release
 
+# Create a special empty file which we check within the application.
+# If this file exists, then we exit Vaultwarden to prevent data loss when someone forgets to use volumes.
+# If you really really want to use volatile storage you can set the env `I_REALLY_WANT_VOLATILE_STORAGE=true`
+# This file should disappear if a volume is mounted on-top of this using a docker volume.
+# We run this in the build image and copy it over, because the runtime image could be missing some executables.
+# hadolint ignore=DL3059
+RUN touch /vaultwarden_docker_persistent_volume_check
+
 ######################## RUNTIME IMAGE  ########################
 # Create a new stage with a minimal image
 # because we already have a binary built
@@ -117,6 +123,7 @@ EXPOSE 3012
 # and the binary from the "build" stage to the current stage
 WORKDIR /
 COPY --from=vault /web-vault ./web-vault
+COPY --from=build /vaultwarden_docker_persistent_volume_check /data/vaultwarden_docker_persistent_volume_check
 COPY --from=build /app/target/release/vaultwarden .
 
 COPY docker/healthcheck.sh /healthcheck.sh

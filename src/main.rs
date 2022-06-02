@@ -276,6 +276,20 @@ fn check_data_folder() {
         }
         exit(1);
     }
+
+    let persistent_volume_check_file = format!("{data_folder}/vaultwarden_docker_persistent_volume_check");
+    let check_file = Path::new(&persistent_volume_check_file);
+    if check_file.exists() && std::env::var("I_REALLY_WANT_VOLATILE_STORAGE").is_err() {
+        error!(
+            "No persistent volume!\n\
+            ########################################################################################\n\
+            # It looks like you did not configure a persistent volume!                             #\n\
+            # This will result in permanent data loss when the container is removed or updated!    #\n\
+            # If you really want to use volatile storage set `I_REALLY_WANT_VOLATILE_STORAGE=true` #\n\
+            ########################################################################################\n"
+        );
+        exit(1);
+    }
 }
 
 fn check_rsa_keys() -> Result<(), crate::error::Error> {
@@ -336,10 +350,11 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
 
     let mut config = rocket::Config::from(rocket::Config::figment());
     config.temp_dir = canonicalize(CONFIG.tmp_folder()).unwrap().into();
-    config.limits = Limits::new() //
-        .limit("json", 10.megabytes())
-        .limit("data-form", 150.megabytes())
-        .limit("file", 150.megabytes());
+    config.cli_colors = false; // Make sure Rocket does not color any values for logging.
+    config.limits = Limits::new()
+        .limit("json", 20.megabytes()) // 20MB should be enough for very large imports, something like 5000+ vault entries
+        .limit("data-form", 525.megabytes()) // This needs to match the maximum allowed file size for Send
+        .limit("file", 525.megabytes()); // This needs to match the maximum allowed file size for attachments
 
     // If adding more paths here, consider also adding them to
     // crate::utils::LOGGED_ROUTES to make sure they appear in the log
@@ -365,7 +380,7 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
     })
     .expect("Error setting Ctrl-C handler");
 
-    instance.launch().await?;
+    let _ = instance.launch().await?;
 
     info!("Vaultwarden process exited!");
     Ok(())
@@ -377,12 +392,13 @@ async fn schedule_jobs(pool: db::DbPool) {
         return;
     }
 
-    let runtime = tokio::runtime::Handle::current();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
 
     thread::Builder::new()
         .name("job-scheduler".to_string())
         .spawn(move || {
             use job_scheduler::{Job, JobScheduler};
+            let _runtime_guard = runtime.enter();
 
             let mut sched = JobScheduler::new();
 
