@@ -31,7 +31,9 @@ db_object! {
     }
 }
 
+// https://github.com/bitwarden/server/blob/b86a04cef9f1e1b82cf18e49fc94e017c641130c/src/Core/Enums/OrganizationUserStatusType.cs
 pub enum UserOrgStatus {
+    Revoked = -1,
     Invited = 0,
     Accepted = 1,
     Confirmed = 2,
@@ -133,26 +135,29 @@ impl Organization {
             public_key,
         }
     }
-
+    // https://github.com/bitwarden/server/blob/13d1e74d6960cf0d042620b72d85bf583a4236f7/src/Api/Models/Response/Organizations/OrganizationResponseModel.cs
     pub fn to_json(&self) -> Value {
         json!({
             "Id": self.uuid,
             "Identifier": null, // not supported by us
             "Name": self.name,
             "Seats": 10, // The value doesn't matter, we don't check server-side
+            // "MaxAutoscaleSeats": null, // The value doesn't matter, we don't check server-side
             "MaxCollections": 10, // The value doesn't matter, we don't check server-side
             "MaxStorageGb": 10, // The value doesn't matter, we don't check server-side
             "Use2fa": true,
             "UseDirectory": false, // Is supported, but this value isn't checked anywhere (yet)
-            "UseEvents": false, // not supported by us
-            "UseGroups": false, // not supported by us
+            "UseEvents": false, // Not supported
+            "UseGroups": false, // Not supported
             "UseTotp": true,
             "UsePolicies": true,
-            "UseSso": false, // We do not support SSO
+            // "UseScim": false, // Not supported (Not AGPLv3 Licensed)
+            "UseSso": false, // Not supported
+            // "UseKeyConnector": false, // Not supported
             "SelfHost": true,
-            "UseApi": false, // not supported by us
+            "UseApi": false, // Not supported
             "HasPublicAndPrivateKeys": self.private_key.is_some() && self.public_key.is_some(),
-            "ResetPasswordEnrolled": false, // not supported by us
+            "UseResetPassword": false, // Not supported
 
             "BusinessName": null,
             "BusinessAddress1": null,
@@ -170,6 +175,12 @@ impl Organization {
     }
 }
 
+// Used to either subtract or add to the current status
+// The number 128 should be fine, it is well within the range of an i32
+// The same goes for the database where we only use INTEGER (the same as an i32)
+// It should also provide enough room for 100+ types, which i doubt will ever happen.
+static ACTIVATE_REVOKE_DIFF: i32 = 128;
+
 impl UserOrganization {
     pub fn new(user_uuid: String, org_uuid: String) -> Self {
         Self {
@@ -184,6 +195,18 @@ impl UserOrganization {
             atype: UserOrgType::User as i32,
         }
     }
+
+    pub fn activate(&mut self) {
+        if self.status < UserOrgStatus::Accepted as i32 {
+            self.status += ACTIVATE_REVOKE_DIFF;
+        }
+    }
+
+    pub fn revoke(&mut self) {
+        if self.status > UserOrgStatus::Revoked as i32 {
+            self.status -= ACTIVATE_REVOKE_DIFF;
+        }
+    }
 }
 
 use crate::db::DbConn;
@@ -193,10 +216,10 @@ use crate::error::MapResult;
 
 /// Database methods
 impl Organization {
-    pub fn save(&self, conn: &DbConn) -> EmptyResult {
-        UserOrganization::find_by_org(&self.uuid, conn).iter().for_each(|user_org| {
-            User::update_uuid_revision(&user_org.user_uuid, conn);
-        });
+    pub async fn save(&self, conn: &DbConn) -> EmptyResult {
+        for user_org in UserOrganization::find_by_org(&self.uuid, conn).await.iter() {
+            User::update_uuid_revision(&user_org.user_uuid, conn).await;
+        }
 
         db_run! { conn:
             sqlite, mysql {
@@ -230,13 +253,13 @@ impl Organization {
         }
     }
 
-    pub fn delete(self, conn: &DbConn) -> EmptyResult {
+    pub async fn delete(self, conn: &DbConn) -> EmptyResult {
         use super::{Cipher, Collection};
 
-        Cipher::delete_all_by_organization(&self.uuid, conn)?;
-        Collection::delete_all_by_organization(&self.uuid, conn)?;
-        UserOrganization::delete_all_by_organization(&self.uuid, conn)?;
-        OrgPolicy::delete_all_by_organization(&self.uuid, conn)?;
+        Cipher::delete_all_by_organization(&self.uuid, conn).await?;
+        Collection::delete_all_by_organization(&self.uuid, conn).await?;
+        UserOrganization::delete_all_by_organization(&self.uuid, conn).await?;
+        OrgPolicy::delete_all_by_organization(&self.uuid, conn).await?;
 
         db_run! { conn: {
             diesel::delete(organizations::table.filter(organizations::uuid.eq(self.uuid)))
@@ -245,7 +268,7 @@ impl Organization {
         }}
     }
 
-    pub fn find_by_uuid(uuid: &str, conn: &DbConn) -> Option<Self> {
+    pub async fn find_by_uuid(uuid: &str, conn: &DbConn) -> Option<Self> {
         db_run! { conn: {
             organizations::table
                 .filter(organizations::uuid.eq(uuid))
@@ -254,7 +277,7 @@ impl Organization {
         }}
     }
 
-    pub fn get_all(conn: &DbConn) -> Vec<Self> {
+    pub async fn get_all(conn: &DbConn) -> Vec<Self> {
         db_run! { conn: {
             organizations::table.load::<OrganizationDb>(conn).expect("Error loading organizations").from_db()
         }}
@@ -262,12 +285,13 @@ impl Organization {
 }
 
 impl UserOrganization {
-    pub fn to_json(&self, conn: &DbConn) -> Value {
-        let org = Organization::find_by_uuid(&self.org_uuid, conn).unwrap();
+    pub async fn to_json(&self, conn: &DbConn) -> Value {
+        let org = Organization::find_by_uuid(&self.org_uuid, conn).await.unwrap();
 
+        // https://github.com/bitwarden/server/blob/13d1e74d6960cf0d042620b72d85bf583a4236f7/src/Api/Models/Response/ProfileOrganizationResponseModel.cs
         json!({
             "Id": self.org_uuid,
-            "Identifier": null, // not supported by us
+            "Identifier": null, // Not supported
             "Name": org.name,
             "Seats": 10, // The value doesn't matter, we don't check server-side
             "MaxCollections": 10, // The value doesn't matter, we don't check server-side
@@ -275,44 +299,48 @@ impl UserOrganization {
 
             "Use2fa": true,
             "UseDirectory": false, // Is supported, but this value isn't checked anywhere (yet)
-            "UseEvents": false, // not supported by us
-            "UseGroups": false, // not supported by us
+            "UseEvents": false, // Not supported
+            "UseGroups": false, // Not supported
             "UseTotp": true,
+            // "UseScim": false, // Not supported (Not AGPLv3 Licensed)
             "UsePolicies": true,
-            "UseApi": false, // not supported by us
+            "UseApi": false, // Not supported
             "SelfHost": true,
             "HasPublicAndPrivateKeys": org.private_key.is_some() && org.public_key.is_some(),
-            "ResetPasswordEnrolled": false, // not supported by us
-            "SsoBound": false, // We do not support SSO
-            "UseSso": false, // We do not support SSO
-            // TODO: Add support for Business Portal
-            // Upstream is moving Policies and SSO management outside of the web-vault to /portal
-            // For now they still have that code also in the web-vault, but they will remove it at some point.
-            // https://github.com/bitwarden/server/tree/master/bitwarden_license/src/
-            "UseBusinessPortal": false, // Disable BusinessPortal Button
+            "ResetPasswordEnrolled": false, // Not supported
+            "SsoBound": false, // Not supported
+            "UseSso": false, // Not supported
             "ProviderId": null,
             "ProviderName": null,
+            // "KeyConnectorEnabled": false,
+            // "KeyConnectorUrl": null,
 
             // TODO: Add support for Custom User Roles
             // See: https://bitwarden.com/help/article/user-types-access-control/#custom-role
             // "Permissions": {
-            //     "AccessBusinessPortal": false,
-            //     "AccessEventLogs": false,
+            //     "AccessEventLogs": false, // Not supported
             //     "AccessImportExport": false,
             //     "AccessReports": false,
             //     "ManageAllCollections": false,
+            //     "CreateNewCollections": false,
+            //     "EditAnyCollection": false,
+            //     "DeleteAnyCollection": false,
             //     "ManageAssignedCollections": false,
+            //     "editAssignedCollections": false,
+            //     "deleteAssignedCollections": false,
             //     "ManageCiphers": false,
-            //     "ManageGroups": false,
+            //     "ManageGroups": false, // Not supported
             //     "ManagePolicies": false,
-            //     "ManageResetPassword": false,
-            //     "ManageSso": false,
+            //     "ManageResetPassword": false, // Not supported
+            //     "ManageSso": false, // Not supported
             //     "ManageUsers": false,
+            //     "ManageScim": false, // Not supported (Not AGPLv3 Licensed)
             // },
 
             "MaxStorageGb": 10, // The value doesn't matter, we don't check server-side
 
             // These are per user
+            "UserId": self.user_uuid,
             "Key": self.akey,
             "Status": self.status,
             "Type": self.atype,
@@ -322,8 +350,16 @@ impl UserOrganization {
         })
     }
 
-    pub fn to_json_user_details(&self, conn: &DbConn) -> Value {
-        let user = User::find_by_uuid(&self.user_uuid, conn).unwrap();
+    pub async fn to_json_user_details(&self, conn: &DbConn) -> Value {
+        let user = User::find_by_uuid(&self.user_uuid, conn).await.unwrap();
+
+        // Because BitWarden want the status to be -1 for revoked users we need to catch that here.
+        // We subtract/add a number so we can restore/activate the user to it's previouse state again.
+        let status = if self.status < UserOrgStatus::Revoked as i32 {
+            UserOrgStatus::Revoked as i32
+        } else {
+            self.status
+        };
 
         json!({
             "Id": self.uuid,
@@ -331,7 +367,7 @@ impl UserOrganization {
             "Name": user.name,
             "Email": user.email,
 
-            "Status": self.status,
+            "Status": status,
             "Type": self.atype,
             "AccessAll": self.access_all,
 
@@ -347,11 +383,12 @@ impl UserOrganization {
         })
     }
 
-    pub fn to_json_details(&self, conn: &DbConn) -> Value {
+    pub async fn to_json_details(&self, conn: &DbConn) -> Value {
         let coll_uuids = if self.access_all {
             vec![] // If we have complete access, no need to fill the array
         } else {
-            let collections = CollectionUser::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn);
+            let collections =
+                CollectionUser::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn).await;
             collections
                 .iter()
                 .map(|c| {
@@ -364,11 +401,19 @@ impl UserOrganization {
                 .collect()
         };
 
+        // Because BitWarden want the status to be -1 for revoked users we need to catch that here.
+        // We subtract/add a number so we can restore/activate the user to it's previouse state again.
+        let status = if self.status < UserOrgStatus::Revoked as i32 {
+            UserOrgStatus::Revoked as i32
+        } else {
+            self.status
+        };
+
         json!({
             "Id": self.uuid,
             "UserId": self.user_uuid,
 
-            "Status": self.status,
+            "Status": status,
             "Type": self.atype,
             "AccessAll": self.access_all,
             "Collections": coll_uuids,
@@ -376,8 +421,8 @@ impl UserOrganization {
             "Object": "organizationUserDetails",
         })
     }
-    pub fn save(&self, conn: &DbConn) -> EmptyResult {
-        User::update_uuid_revision(&self.user_uuid, conn);
+    pub async fn save(&self, conn: &DbConn) -> EmptyResult {
+        User::update_uuid_revision(&self.user_uuid, conn).await;
 
         db_run! { conn:
             sqlite, mysql {
@@ -410,10 +455,10 @@ impl UserOrganization {
         }
     }
 
-    pub fn delete(self, conn: &DbConn) -> EmptyResult {
-        User::update_uuid_revision(&self.user_uuid, conn);
+    pub async fn delete(self, conn: &DbConn) -> EmptyResult {
+        User::update_uuid_revision(&self.user_uuid, conn).await;
 
-        CollectionUser::delete_all_by_user_and_org(&self.user_uuid, &self.org_uuid, conn)?;
+        CollectionUser::delete_all_by_user_and_org(&self.user_uuid, &self.org_uuid, conn).await?;
 
         db_run! { conn: {
             diesel::delete(users_organizations::table.filter(users_organizations::uuid.eq(self.uuid)))
@@ -422,23 +467,23 @@ impl UserOrganization {
         }}
     }
 
-    pub fn delete_all_by_organization(org_uuid: &str, conn: &DbConn) -> EmptyResult {
-        for user_org in Self::find_by_org(org_uuid, conn) {
-            user_org.delete(conn)?;
+    pub async fn delete_all_by_organization(org_uuid: &str, conn: &DbConn) -> EmptyResult {
+        for user_org in Self::find_by_org(org_uuid, conn).await {
+            user_org.delete(conn).await?;
         }
         Ok(())
     }
 
-    pub fn delete_all_by_user(user_uuid: &str, conn: &DbConn) -> EmptyResult {
-        for user_org in Self::find_any_state_by_user(user_uuid, conn) {
-            user_org.delete(conn)?;
+    pub async fn delete_all_by_user(user_uuid: &str, conn: &DbConn) -> EmptyResult {
+        for user_org in Self::find_any_state_by_user(user_uuid, conn).await {
+            user_org.delete(conn).await?;
         }
         Ok(())
     }
 
-    pub fn find_by_email_and_org(email: &str, org_id: &str, conn: &DbConn) -> Option<UserOrganization> {
-        if let Some(user) = super::User::find_by_mail(email, conn) {
-            if let Some(user_org) = UserOrganization::find_by_user_and_org(&user.uuid, org_id, conn) {
+    pub async fn find_by_email_and_org(email: &str, org_id: &str, conn: &DbConn) -> Option<UserOrganization> {
+        if let Some(user) = super::User::find_by_mail(email, conn).await {
+            if let Some(user_org) = UserOrganization::find_by_user_and_org(&user.uuid, org_id, conn).await {
                 return Some(user_org);
             }
         }
@@ -458,7 +503,7 @@ impl UserOrganization {
         (self.access_all || self.atype >= UserOrgType::Admin) && self.has_status(UserOrgStatus::Confirmed)
     }
 
-    pub fn find_by_uuid(uuid: &str, conn: &DbConn) -> Option<Self> {
+    pub async fn find_by_uuid(uuid: &str, conn: &DbConn) -> Option<Self> {
         db_run! { conn: {
             users_organizations::table
                 .filter(users_organizations::uuid.eq(uuid))
@@ -467,7 +512,7 @@ impl UserOrganization {
         }}
     }
 
-    pub fn find_by_uuid_and_org(uuid: &str, org_uuid: &str, conn: &DbConn) -> Option<Self> {
+    pub async fn find_by_uuid_and_org(uuid: &str, org_uuid: &str, conn: &DbConn) -> Option<Self> {
         db_run! { conn: {
             users_organizations::table
                 .filter(users_organizations::uuid.eq(uuid))
@@ -477,7 +522,7 @@ impl UserOrganization {
         }}
     }
 
-    pub fn find_confirmed_by_user(user_uuid: &str, conn: &DbConn) -> Vec<Self> {
+    pub async fn find_confirmed_by_user(user_uuid: &str, conn: &DbConn) -> Vec<Self> {
         db_run! { conn: {
             users_organizations::table
                 .filter(users_organizations::user_uuid.eq(user_uuid))
@@ -487,7 +532,7 @@ impl UserOrganization {
         }}
     }
 
-    pub fn find_invited_by_user(user_uuid: &str, conn: &DbConn) -> Vec<Self> {
+    pub async fn find_invited_by_user(user_uuid: &str, conn: &DbConn) -> Vec<Self> {
         db_run! { conn: {
             users_organizations::table
                 .filter(users_organizations::user_uuid.eq(user_uuid))
@@ -497,7 +542,7 @@ impl UserOrganization {
         }}
     }
 
-    pub fn find_any_state_by_user(user_uuid: &str, conn: &DbConn) -> Vec<Self> {
+    pub async fn find_any_state_by_user(user_uuid: &str, conn: &DbConn) -> Vec<Self> {
         db_run! { conn: {
             users_organizations::table
                 .filter(users_organizations::user_uuid.eq(user_uuid))
@@ -506,7 +551,19 @@ impl UserOrganization {
         }}
     }
 
-    pub fn find_by_org(org_uuid: &str, conn: &DbConn) -> Vec<Self> {
+    pub async fn count_accepted_and_confirmed_by_user(user_uuid: &str, conn: &DbConn) -> i64 {
+        db_run! { conn: {
+            users_organizations::table
+                .filter(users_organizations::user_uuid.eq(user_uuid))
+                .filter(users_organizations::status.eq(UserOrgStatus::Accepted as i32))
+                .or_filter(users_organizations::status.eq(UserOrgStatus::Confirmed as i32))
+                .count()
+                .first::<i64>(conn)
+                .unwrap_or(0)
+        }}
+    }
+
+    pub async fn find_by_org(org_uuid: &str, conn: &DbConn) -> Vec<Self> {
         db_run! { conn: {
             users_organizations::table
                 .filter(users_organizations::org_uuid.eq(org_uuid))
@@ -515,7 +572,7 @@ impl UserOrganization {
         }}
     }
 
-    pub fn count_by_org(org_uuid: &str, conn: &DbConn) -> i64 {
+    pub async fn count_by_org(org_uuid: &str, conn: &DbConn) -> i64 {
         db_run! { conn: {
             users_organizations::table
                 .filter(users_organizations::org_uuid.eq(org_uuid))
@@ -526,17 +583,29 @@ impl UserOrganization {
         }}
     }
 
-    pub fn find_by_org_and_type(org_uuid: &str, atype: i32, conn: &DbConn) -> Vec<Self> {
+    pub async fn find_by_org_and_type(org_uuid: &str, atype: UserOrgType, conn: &DbConn) -> Vec<Self> {
         db_run! { conn: {
             users_organizations::table
                 .filter(users_organizations::org_uuid.eq(org_uuid))
-                .filter(users_organizations::atype.eq(atype))
+                .filter(users_organizations::atype.eq(atype as i32))
                 .load::<UserOrganizationDb>(conn)
                 .expect("Error loading user organizations").from_db()
         }}
     }
 
-    pub fn find_by_user_and_org(user_uuid: &str, org_uuid: &str, conn: &DbConn) -> Option<Self> {
+    pub async fn count_confirmed_by_org_and_type(org_uuid: &str, atype: UserOrgType, conn: &DbConn) -> i64 {
+        db_run! { conn: {
+            users_organizations::table
+                .filter(users_organizations::org_uuid.eq(org_uuid))
+                .filter(users_organizations::atype.eq(atype as i32))
+                .filter(users_organizations::status.eq(UserOrgStatus::Confirmed as i32))
+                .count()
+                .first::<i64>(conn)
+                .unwrap_or(0)
+        }}
+    }
+
+    pub async fn find_by_user_and_org(user_uuid: &str, org_uuid: &str, conn: &DbConn) -> Option<Self> {
         db_run! { conn: {
             users_organizations::table
                 .filter(users_organizations::user_uuid.eq(user_uuid))
@@ -546,7 +615,16 @@ impl UserOrganization {
         }}
     }
 
-    pub fn find_by_user_and_policy(user_uuid: &str, policy_type: OrgPolicyType, conn: &DbConn) -> Vec<Self> {
+    pub async fn find_by_user(user_uuid: &str, conn: &DbConn) -> Vec<Self> {
+        db_run! { conn: {
+            users_organizations::table
+                .filter(users_organizations::user_uuid.eq(user_uuid))
+                .load::<UserOrganizationDb>(conn)
+                .expect("Error loading user organizations").from_db()
+        }}
+    }
+
+    pub async fn find_by_user_and_policy(user_uuid: &str, policy_type: OrgPolicyType, conn: &DbConn) -> Vec<Self> {
         db_run! { conn: {
             users_organizations::table
                 .inner_join(
@@ -565,7 +643,7 @@ impl UserOrganization {
         }}
     }
 
-    pub fn find_by_cipher_and_org(cipher_uuid: &str, org_uuid: &str, conn: &DbConn) -> Vec<Self> {
+    pub async fn find_by_cipher_and_org(cipher_uuid: &str, org_uuid: &str, conn: &DbConn) -> Vec<Self> {
         db_run! { conn: {
             users_organizations::table
             .filter(users_organizations::org_uuid.eq(org_uuid))
@@ -587,7 +665,7 @@ impl UserOrganization {
         }}
     }
 
-    pub fn find_by_collection_and_org(collection_uuid: &str, org_uuid: &str, conn: &DbConn) -> Vec<Self> {
+    pub async fn find_by_collection_and_org(collection_uuid: &str, org_uuid: &str, conn: &DbConn) -> Vec<Self> {
         db_run! { conn: {
             users_organizations::table
             .filter(users_organizations::org_uuid.eq(org_uuid))

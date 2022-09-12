@@ -16,18 +16,18 @@
 # - From https://hub.docker.com/r/vaultwarden/web-vault/tags,
 #   click the tag name to view the digest of the image it currently points to.
 # - From the command line:
-#     $ docker pull vaultwarden/web-vault:v2.25.1b
-#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2.25.1b
-#     [vaultwarden/web-vault@sha256:9b82318d553d72f091e8755f5aff80eed495f90bbe5b0703522953480f5c2fba]
+#     $ docker pull vaultwarden/web-vault:v2022.9.0
+#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2022.9.0
+#     [vaultwarden/web-vault@sha256:99d21235a64084c9115f4aa3da1298881b8bbf146c0d48d6530b4d685a6a6fbc]
 #
 # - Conversely, to get the tag name from the digest:
-#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:9b82318d553d72f091e8755f5aff80eed495f90bbe5b0703522953480f5c2fba
-#     [vaultwarden/web-vault:v2.25.1b]
+#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:99d21235a64084c9115f4aa3da1298881b8bbf146c0d48d6530b4d685a6a6fbc
+#     [vaultwarden/web-vault:v2022.9.0]
 #
-FROM vaultwarden/web-vault@sha256:9b82318d553d72f091e8755f5aff80eed495f90bbe5b0703522953480f5c2fba as vault
+FROM vaultwarden/web-vault@sha256:99d21235a64084c9115f4aa3da1298881b8bbf146c0d48d6530b4d685a6a6fbc as vault
 
 ########################## BUILD IMAGE  ##########################
-FROM rust:1.58-buster as build
+FROM rust:1.61-bullseye as build
 
 
 
@@ -107,11 +107,11 @@ RUN cargo build --features ${DB} --release --target=arm-unknown-linux-gnueabi
 ######################## RUNTIME IMAGE  ########################
 # Create a new stage with a minimal image
 # because we already have a binary built
-FROM balenalib/rpi-debian:buster
+FROM balenalib/rpi-debian:bullseye
 
-ENV ROCKET_ENV="staging" \
-    ROCKET_PORT=80 \
-    ROCKET_WORKERS=10
+ENV ROCKET_PROFILE="release" \
+    ROCKET_ADDRESS=0.0.0.0 \
+    ROCKET_PORT=80
 
 # hadolint ignore=DL3059
 RUN [ "cross-build-start" ]
@@ -123,11 +123,15 @@ RUN mkdir /data \
     openssl \
     ca-certificates \
     curl \
-    dumb-init \
     libmariadb-dev-compat \
     libpq5 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# In the Balena Bullseye images for armv6/rpi-debian there is a missing symlink.
+# This symlink was there in the buster images, and for some reason this is needed.
+# hadolint ignore=DL3059
+RUN ln -v -s /lib/ld-linux-armhf.so.3 /lib/ld-linux.so.3
 
 # hadolint ignore=DL3059
 RUN [ "cross-build-end" ]
@@ -139,7 +143,6 @@ EXPOSE 3012
 # Copies the files from the context (Rocket.toml file and web-vault)
 # and the binary from the "build" stage to the current stage
 WORKDIR /
-COPY Rocket.toml .
 COPY --from=vault /web-vault ./web-vault
 COPY --from=build /app/target/arm-unknown-linux-gnueabi/release/vaultwarden .
 
@@ -148,6 +151,4 @@ COPY docker/start.sh /start.sh
 
 HEALTHCHECK --interval=60s --timeout=10s CMD ["/healthcheck.sh"]
 
-# Configures the startup!
-ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 CMD ["/start.sh"]
