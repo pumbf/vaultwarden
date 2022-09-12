@@ -27,7 +27,6 @@
 
 FROM pumbf.cn/bw-web:v2022.9.0 as vault
 
-
 ########################## BUILD IMAGE  ##########################
 FROM rust:1.61-bullseye as build
 
