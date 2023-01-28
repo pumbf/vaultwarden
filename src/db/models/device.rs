@@ -4,9 +4,9 @@ use crate::CONFIG;
 
 db_object! {
     #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
-    #[table_name = "devices"]
-    #[changeset_options(treat_none_as_null="true")]
-    #[primary_key(uuid, user_uuid)]
+    #[diesel(table_name = devices)]
+    #[diesel(treat_none_as_null = true)]
+    #[diesel(primary_key(uuid, user_uuid))]
     pub struct Device {
         pub uuid: String,
         pub created_at: NaiveDateTime,
@@ -48,7 +48,7 @@ impl Device {
         use crate::crypto;
         use data_encoding::BASE64;
 
-        let twofactor_remember = BASE64.encode(&crypto::get_random(vec![0u8; 180]));
+        let twofactor_remember = crypto::encode_random_bytes::<180>(BASE64);
         self.twofactor_remember = Some(twofactor_remember.clone());
 
         twofactor_remember
@@ -69,7 +69,7 @@ impl Device {
             use crate::crypto;
             use data_encoding::BASE64URL;
 
-            self.refresh_token = BASE64URL.encode(&crypto::get_random_64());
+            self.refresh_token = crypto::encode_random_bytes::<64>(BASE64URL);
         }
 
         // Update the expiration of the device and the last update date
@@ -87,11 +87,11 @@ impl Device {
             nbf: time_now.timestamp(),
             exp: (time_now + *DEFAULT_VALIDITY).timestamp(),
             iss: JWT_LOGIN_ISSUER.to_string(),
-            sub: user.uuid.to_string(),
+            sub: user.uuid.clone(),
 
             premium: true,
-            name: user.name.to_string(),
-            email: user.email.to_string(),
+            name: user.name.clone(),
+            email: user.email.clone(),
             email_verified: !CONFIG.mail_enabled() || user.verified_at.is_some(),
 
             orgowner,
@@ -99,8 +99,8 @@ impl Device {
             orguser,
             orgmanager,
 
-            sstamp: user.security_stamp.to_string(),
-            device: self.uuid.to_string(),
+            sstamp: user.security_stamp.clone(),
+            device: self.uuid.clone(),
             scope,
             amr: vec!["Application".into()],
         };
@@ -116,7 +116,7 @@ use crate::error::MapResult;
 
 /// Database methods
 impl Device {
-    pub async fn save(&mut self, conn: &DbConn) -> EmptyResult {
+    pub async fn save(&mut self, conn: &mut DbConn) -> EmptyResult {
         self.updated_at = Utc::now().naive_utc();
 
         db_run! { conn:
@@ -136,7 +136,7 @@ impl Device {
         }
     }
 
-    pub async fn delete_all_by_user(user_uuid: &str, conn: &DbConn) -> EmptyResult {
+    pub async fn delete_all_by_user(user_uuid: &str, conn: &mut DbConn) -> EmptyResult {
         db_run! { conn: {
             diesel::delete(devices::table.filter(devices::user_uuid.eq(user_uuid)))
                 .execute(conn)
@@ -144,7 +144,7 @@ impl Device {
         }}
     }
 
-    pub async fn find_by_uuid_and_user(uuid: &str, user_uuid: &str, conn: &DbConn) -> Option<Self> {
+    pub async fn find_by_uuid_and_user(uuid: &str, user_uuid: &str, conn: &mut DbConn) -> Option<Self> {
         db_run! { conn: {
             devices::table
                 .filter(devices::uuid.eq(uuid))
@@ -155,7 +155,7 @@ impl Device {
         }}
     }
 
-    pub async fn find_by_refresh_token(refresh_token: &str, conn: &DbConn) -> Option<Self> {
+    pub async fn find_by_refresh_token(refresh_token: &str, conn: &mut DbConn) -> Option<Self> {
         db_run! { conn: {
             devices::table
                 .filter(devices::refresh_token.eq(refresh_token))
@@ -165,7 +165,7 @@ impl Device {
         }}
     }
 
-    pub async fn find_latest_active_by_user(user_uuid: &str, conn: &DbConn) -> Option<Self> {
+    pub async fn find_latest_active_by_user(user_uuid: &str, conn: &mut DbConn) -> Option<Self> {
         db_run! { conn: {
             devices::table
                 .filter(devices::user_uuid.eq(user_uuid))

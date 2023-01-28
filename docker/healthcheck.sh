@@ -2,8 +2,8 @@
 
 # Use the value of the corresponding env var (if present),
 # or a default value otherwise.
-: ${DATA_FOLDER:="data"}
-: ${ROCKET_PORT:="80"}
+: "${DATA_FOLDER:="data"}"
+: "${ROCKET_PORT:="80"}"
 
 CONFIG_FILE="${DATA_FOLDER}"/config.json
 
@@ -45,9 +45,13 @@ if [ -r "${CONFIG_FILE}" ]; then
     fi
 fi
 
+addr="${ROCKET_ADDRESS}"
+if [ -z "${addr}" ] || [ "${addr}" = '0.0.0.0' ] || [ "${addr}" = '::' ]; then
+    addr='localhost'
+fi
 base_path="$(get_base_path "${DOMAIN}")"
 if [ -n "${ROCKET_TLS}" ]; then
     s='s'
 fi
 curl --insecure --fail --silent --show-error \
-     "http${s}://localhost:${ROCKET_PORT}${base_path}/alive" || exit 1
+     "http${s}://${addr}:${ROCKET_PORT}${base_path}/alive" || exit 1

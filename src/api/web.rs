@@ -1,11 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use rocket::serde::json::Json;
-use rocket::{fs::NamedFile, http::ContentType, Route};
+use rocket::{fs::NamedFile, http::ContentType, response::content::RawHtml as Html, serde::json::Json, Catcher, Route};
 use serde_json::Value;
 
 use crate::{
-    api::core::now,
+    api::{core::now, ApiResult},
     error::Error,
     util::{Cached, SafeString},
     CONFIG,
@@ -19,6 +18,24 @@ pub fn routes() -> Vec<Route> {
     } else {
         routes![attachments, alive, static_files]
     }
+}
+
+pub fn catchers() -> Vec<Catcher> {
+    if CONFIG.web_vault_enabled() {
+        catchers![not_found]
+    } else {
+        catchers![]
+    }
+}
+
+#[catch(404)]
+fn not_found() -> ApiResult<Html<String>> {
+    // Return the page
+    let json = json!({
+        "urlpath": CONFIG.domain_path()
+    });
+    let text = CONFIG.render_template("404", &json)?;
+    Ok(Html(text))
 }
 
 #[get("/")]
@@ -76,21 +93,34 @@ fn alive(_conn: DbConn) -> Json<String> {
 }
 
 #[get("/vw_static/<filename>")]
-fn static_files(filename: String) -> Result<(ContentType, &'static [u8]), Error> {
+pub fn static_files(filename: String) -> Result<(ContentType, &'static [u8]), Error> {
     match filename.as_ref() {
+        "404.png" => Ok((ContentType::PNG, include_bytes!("../static/images/404.png"))),
         "mail-github.png" => Ok((ContentType::PNG, include_bytes!("../static/images/mail-github.png"))),
         "logo-gray.png" => Ok((ContentType::PNG, include_bytes!("../static/images/logo-gray.png"))),
         "error-x.svg" => Ok((ContentType::SVG, include_bytes!("../static/images/error-x.svg"))),
         "hibp.png" => Ok((ContentType::PNG, include_bytes!("../static/images/hibp.png"))),
         "vaultwarden-icon.png" => Ok((ContentType::PNG, include_bytes!("../static/images/vaultwarden-icon.png"))),
+        "vaultwarden-favicon.png" => Ok((ContentType::PNG, include_bytes!("../static/images/vaultwarden-favicon.png"))),
+        "404.css" => Ok((ContentType::CSS, include_bytes!("../static/scripts/404.css"))),
+        "admin.css" => Ok((ContentType::CSS, include_bytes!("../static/scripts/admin.css"))),
+        "admin.js" => Ok((ContentType::JavaScript, include_bytes!("../static/scripts/admin.js"))),
+        "admin_settings.js" => Ok((ContentType::JavaScript, include_bytes!("../static/scripts/admin_settings.js"))),
+        "admin_users.js" => Ok((ContentType::JavaScript, include_bytes!("../static/scripts/admin_users.js"))),
+        "admin_organizations.js" => {
+            Ok((ContentType::JavaScript, include_bytes!("../static/scripts/admin_organizations.js")))
+        }
+        "admin_diagnostics.js" => {
+            Ok((ContentType::JavaScript, include_bytes!("../static/scripts/admin_diagnostics.js")))
+        }
         "bootstrap.css" => Ok((ContentType::CSS, include_bytes!("../static/scripts/bootstrap.css"))),
         "bootstrap-native.js" => Ok((ContentType::JavaScript, include_bytes!("../static/scripts/bootstrap-native.js"))),
-        "identicon.js" => Ok((ContentType::JavaScript, include_bytes!("../static/scripts/identicon.js"))),
+        "jdenticon.js" => Ok((ContentType::JavaScript, include_bytes!("../static/scripts/jdenticon.js"))),
         "datatables.js" => Ok((ContentType::JavaScript, include_bytes!("../static/scripts/datatables.js"))),
         "datatables.css" => Ok((ContentType::CSS, include_bytes!("../static/scripts/datatables.css"))),
-        "jquery-3.6.0.slim.js" => {
-            Ok((ContentType::JavaScript, include_bytes!("../static/scripts/jquery-3.6.0.slim.js")))
+        "jquery-3.6.2.slim.js" => {
+            Ok((ContentType::JavaScript, include_bytes!("../static/scripts/jquery-3.6.2.slim.js")))
         }
-        _ => err!(format!("Static file not found: {}", filename)),
+        _ => err!(format!("Static file not found: {filename}")),
     }
 }

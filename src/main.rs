@@ -1,12 +1,40 @@
-#![forbid(unsafe_code)]
-#![warn(rust_2018_idioms)]
-#![warn(rust_2021_compatibility)]
+#![forbid(unsafe_code, non_ascii_idents)]
+#![deny(
+    rust_2018_idioms,
+    rust_2021_compatibility,
+    noop_method_call,
+    pointer_structural_match,
+    trivial_casts,
+    trivial_numeric_casts,
+    unused_import_braces,
+    clippy::cast_lossless,
+    clippy::clone_on_ref_ptr,
+    clippy::equatable_if_let,
+    clippy::float_cmp_const,
+    clippy::inefficient_to_string,
+    clippy::iter_on_empty_collections,
+    clippy::iter_on_single_items,
+    clippy::linkedlist,
+    clippy::macro_use_imports,
+    clippy::manual_assert,
+    clippy::manual_instant_elapsed,
+    clippy::manual_string_new,
+    clippy::match_wildcard_for_single_variants,
+    clippy::mem_forget,
+    clippy::string_add_assign,
+    clippy::string_to_string,
+    clippy::unnecessary_join,
+    clippy::unnecessary_self_imports,
+    clippy::unused_async,
+    clippy::verbose_file_reads,
+    clippy::zero_sized_map_values
+)]
 #![cfg_attr(feature = "unstable", feature(ip))]
 // The recursion_limit is mainly triggered by the json!() macro.
 // The more key/value pairs there are the more recursion occurs.
 // We want to keep this as low as possible, but not higher then 128.
 // If you go above 128 it will cause rust-analyzer to fail,
-#![recursion_limit = "87"]
+#![recursion_limit = "97"]
 
 // When enabled use MiMalloc as malloc instead of the default malloc
 #[cfg(feature = "enable_mimalloc")]
@@ -37,6 +65,11 @@ use std::{
     thread,
 };
 
+use tokio::{
+    fs::File,
+    io::{AsyncBufReadExt, BufReader},
+};
+
 #[macro_use]
 mod error;
 mod api;
@@ -65,7 +98,7 @@ async fn main() -> Result<(), Error> {
 
     let extra_debug = matches!(level, LF::Trace | LF::Debug);
 
-    check_data_folder();
+    check_data_folder().await;
     check_rsa_keys().unwrap_or_else(|_| {
         error!("Error creating keys, exiting...");
         exit(1);
@@ -79,7 +112,7 @@ async fn main() -> Result<(), Error> {
 
     let pool = create_db_pool().await;
     schedule_jobs(pool.clone()).await;
-    crate::db::models::TwoFactor::migrate_u2f_to_webauthn(&pool.get().await.unwrap()).await.unwrap();
+    crate::db::models::TwoFactor::migrate_u2f_to_webauthn(&mut pool.get().await.unwrap()).await.unwrap();
 
     launch_rocket(pool, extra_debug).await // Blocks until program termination.
 }
@@ -102,11 +135,11 @@ fn parse_args() {
     let version = VERSION.unwrap_or("(Version info from Git not present)");
 
     if pargs.contains(["-h", "--help"]) {
-        println!("vaultwarden {}", version);
-        print!("{}", HELP);
+        println!("vaultwarden {version}");
+        print!("{HELP}");
         exit(0);
     } else if pargs.contains(["-v", "--version"]) {
-        println!("vaultwarden {}", version);
+        println!("vaultwarden {version}");
         exit(0);
     }
 }
@@ -116,7 +149,7 @@ fn launch_info() {
     println!("|                        Starting Vaultwarden                        |");
 
     if let Some(version) = VERSION {
-        println!("|{:^68}|", format!("Version {}", version));
+        println!("|{:^68}|", format!("Version {version}"));
     }
 
     println!("|--------------------------------------------------------------------|");
@@ -138,6 +171,13 @@ fn init_logging(level: log::LevelFilter) -> Result<(), fern::InitError> {
         log::LevelFilter::Off
     };
 
+    let diesel_logger_level: log::LevelFilter =
+        if cfg!(feature = "query_logger") && std::env::var("QUERY_LOGGER").is_ok() {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Off
+        };
+
     let mut logger = fern::Dispatch::new()
         .level(level)
         // Hide unknown certificate errors if using self-signed
@@ -145,21 +185,20 @@ fn init_logging(level: log::LevelFilter) -> Result<(), fern::InitError> {
         // Hide failed to close stream messages
         .level_for("hyper::server", log::LevelFilter::Warn)
         // Silence rocket logs
-        .level_for("_", log::LevelFilter::Off)
+        .level_for("_", log::LevelFilter::Warn)
         .level_for("rocket::launch", log::LevelFilter::Error)
         .level_for("rocket::launch_", log::LevelFilter::Error)
         .level_for("rocket::rocket", log::LevelFilter::Warn)
         .level_for("rocket::server", log::LevelFilter::Warn)
         .level_for("rocket::fairing::fairings", log::LevelFilter::Warn)
         .level_for("rocket::shield::shield", log::LevelFilter::Warn)
-        // Never show html5ever and hyper::proto logs, too noisy
-        .level_for("html5ever", log::LevelFilter::Off)
         .level_for("hyper::proto", log::LevelFilter::Off)
         .level_for("hyper::client", log::LevelFilter::Off)
         // Prevent cookie_store logs
         .level_for("cookie_store", log::LevelFilter::Off)
         // Variable level for trust-dns used by reqwest
         .level_for("trust_dns_proto", trust_dns_level)
+        .level_for("diesel_logger", diesel_logger_level)
         .chain(std::io::stdout());
 
     // Enable smtp debug logging only specifically for smtp when need.
@@ -185,7 +224,7 @@ fn init_logging(level: log::LevelFilter) -> Result<(), fern::InitError> {
             ))
         });
     } else {
-        logger = logger.format(|out, message, _| out.finish(format_args!("{}", message)));
+        logger = logger.format(|out, message, _| out.finish(format_args!("{message}")));
     }
 
     if let Some(log_file) = CONFIG.log_file() {
@@ -260,11 +299,11 @@ fn chain_syslog(logger: fern::Dispatch) -> fern::Dispatch {
 
 fn create_dir(path: &str, description: &str) {
     // Try to create the specified dir, if it doesn't already exist.
-    let err_msg = format!("Error creating {} directory '{}'", description, path);
+    let err_msg = format!("Error creating {description} directory '{path}'");
     create_dir_all(path).expect(&err_msg);
 }
 
-fn check_data_folder() {
+async fn check_data_folder() {
     let data_folder = &CONFIG.data_folder();
     let path = Path::new(data_folder);
     if !path.exists() {
@@ -276,10 +315,15 @@ fn check_data_folder() {
         }
         exit(1);
     }
+    if !path.is_dir() {
+        error!("Data folder '{}' is not a directory.", data_folder);
+        exit(1);
+    }
 
-    let persistent_volume_check_file = format!("{data_folder}/vaultwarden_docker_persistent_volume_check");
-    let check_file = Path::new(&persistent_volume_check_file);
-    if check_file.exists() && std::env::var("I_REALLY_WANT_VOLATILE_STORAGE").is_err() {
+    if is_running_in_docker()
+        && std::env::var("I_REALLY_WANT_VOLATILE_STORAGE").is_err()
+        && !docker_data_folder_is_persistent(data_folder).await
+    {
         error!(
             "No persistent volume!\n\
             ########################################################################################\n\
@@ -290,6 +334,38 @@ fn check_data_folder() {
         );
         exit(1);
     }
+}
+
+/// Detect when using Docker or Podman the DATA_FOLDER is either a bind-mount or a volume created manually.
+/// If not created manually, then the data will not be persistent.
+/// A none persistent volume in either Docker or Podman is represented by a 64 alphanumerical string.
+/// If we detect this string, we will alert about not having a persistent self defined volume.
+/// This probably means that someone forgot to add `-v /path/to/vaultwarden_data/:/data`
+async fn docker_data_folder_is_persistent(data_folder: &str) -> bool {
+    if let Ok(mountinfo) = File::open("/proc/self/mountinfo").await {
+        // Since there can only be one mountpoint to the DATA_FOLDER
+        // We do a basic check for this mountpoint surrounded by a space.
+        let data_folder_match = if data_folder.starts_with('/') {
+            format!(" {data_folder} ")
+        } else {
+            format!(" /{data_folder} ")
+        };
+        let mut lines = BufReader::new(mountinfo).lines();
+        while let Some(line) = lines.next_line().await.unwrap_or_default() {
+            // Only execute a regex check if we find the base match
+            if line.contains(&data_folder_match) {
+                let re = regex::Regex::new(r"/volumes/[a-z0-9]{64}/_data /").unwrap();
+                if re.is_match(&line) {
+                    return false;
+                }
+                // If we did found a match for the mountpoint, but not the regex, then still stop searching.
+                break;
+            }
+        }
+    }
+    // In all other cases, just assume a true.
+    // This is just an informative check to try and prevent data loss.
+    true
 }
 
 fn check_rsa_keys() -> Result<(), crate::error::Error> {
@@ -306,7 +382,7 @@ fn check_rsa_keys() -> Result<(), crate::error::Error> {
     }
 
     if !util::file_exists(&pub_path) {
-        let rsa_key = openssl::rsa::Rsa::private_key_from_pem(&util::read_file(&priv_path)?)?;
+        let rsa_key = openssl::rsa::Rsa::private_key_from_pem(&std::fs::read(&priv_path)?)?;
 
         let pub_key = rsa_key.public_key_to_pem()?;
         crate::util::write_file(&pub_path, &pub_key)?;
@@ -362,9 +438,13 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
         .mount([basepath, "/"].concat(), api::web_routes())
         .mount([basepath, "/api"].concat(), api::core_routes())
         .mount([basepath, "/admin"].concat(), api::admin_routes())
+        .mount([basepath, "/events"].concat(), api::core_events_routes())
         .mount([basepath, "/identity"].concat(), api::identity_routes())
         .mount([basepath, "/icons"].concat(), api::icons_routes())
         .mount([basepath, "/notifications"].concat(), api::notifications_routes())
+        .register([basepath, "/"].concat(), api::web_catchers())
+        .register([basepath, "/api"].concat(), api::core_catchers())
+        .register([basepath, "/admin"].concat(), api::admin_catchers())
         .manage(pool)
         .manage(api::start_notification_server())
         .attach(util::AppHeaders())
@@ -374,11 +454,12 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
         .await?;
 
     CONFIG.set_rocket_shutdown_handle(instance.shutdown());
-    ctrlc::set_handler(move || {
+
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.expect("Error setting Ctrl-C handler");
         info!("Exiting vaultwarden!");
         CONFIG.shutdown();
-    })
-    .expect("Error setting Ctrl-C handler");
+    });
 
     let _ = instance.launch().await?;
 
@@ -397,7 +478,7 @@ async fn schedule_jobs(pool: db::DbPool) {
     thread::Builder::new()
         .name("job-scheduler".to_string())
         .spawn(move || {
-            use job_scheduler::{Job, JobScheduler};
+            use job_scheduler_ng::{Job, JobScheduler};
             let _runtime_guard = runtime.enter();
 
             let mut sched = JobScheduler::new();
@@ -438,6 +519,16 @@ async fn schedule_jobs(pool: db::DbPool) {
             if !CONFIG.emergency_notification_reminder_schedule().is_empty() {
                 sched.add(Job::new(CONFIG.emergency_notification_reminder_schedule().parse().unwrap(), || {
                     runtime.spawn(api::emergency_notification_reminder_job(pool.clone()));
+                }));
+            }
+
+            // Cleanup the event table of records x days old.
+            if CONFIG.org_events_enabled()
+                && !CONFIG.event_cleanup_schedule().is_empty()
+                && CONFIG.events_days_retain().is_some()
+            {
+                sched.add(Job::new(CONFIG.event_cleanup_schedule().parse().unwrap(), || {
+                    runtime.spawn(api::event_cleanup_job(pool.clone()));
                 }));
             }
 

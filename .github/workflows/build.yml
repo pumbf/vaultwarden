@@ -8,7 +8,6 @@ on:
       - "migrations/**"
       - "Cargo.*"
       - "build.rs"
-      - "diesel.toml"
       - "rust-toolchain"
   pull_request:
     paths:
@@ -17,11 +16,12 @@ on:
       - "migrations/**"
       - "Cargo.*"
       - "build.rs"
-      - "diesel.toml"
       - "rust-toolchain"
 
 jobs:
   build:
+    runs-on: ubuntu-20.04
+    timeout-minutes: 120
     # Make warnings errors, this is to prevent warnings slipping through.
     # This is done globally to prevent rebuilds when the RUSTFLAGS env variable changes.
     env:
@@ -30,118 +30,163 @@ jobs:
       fail-fast: false
       matrix:
         channel:
-          - stable
-        target-triple:
-          - x86_64-unknown-linux-gnu
+          - "rust-toolchain" # The version defined in rust-toolchain
+          - "msrv" # The supported MSRV
         include:
-          - target-triple: x86_64-unknown-linux-gnu
-            host-triple: x86_64-unknown-linux-gnu
-            features: [sqlite,mysql,postgresql,enable_mimalloc] # Remember to update the `cargo test` to match the amount of features
-            channel: stable
-            os: ubuntu-20.04
-            ext: ""
+          - channel: "msrv"
+            version: "1.61.0"
 
-    name: Building ${{ matrix.channel }}-${{ matrix.target-triple }}
-    runs-on: ${{ matrix.os }}
+    name: Build and Test ${{ matrix.channel }}
+
     steps:
       # Checkout the repo
-      - name: Checkout
-        uses: actions/checkout@2541b1294d2704b0964813337f33b291d3f8596b # v3.0.2
+      - name: "Checkout"
+        uses: actions/checkout@755da8c3cf115ac066823e79a1e1788f8940201b # v3.2.0
       # End Checkout the repo
 
-
-      # Install musl-tools when needed
-      - name: Install musl tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-dev musl-tools cmake
-        if: matrix.target-triple == 'x86_64-unknown-linux-musl'
-      # End Install musl-tools when needed
-
-
       # Install dependencies
-      - name: Install dependencies Ubuntu
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssl sqlite build-essential libmariadb-dev-compat libpq-dev libssl-dev pkgconf
-        if: startsWith( matrix.os, 'ubuntu' )
+      - name: "Install dependencies Ubuntu"
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssl sqlite build-essential libmariadb-dev-compat libpq-dev libssl-dev pkg-config
       # End Install dependencies
 
-
-      # Enable Rust Caching
-      - uses: Swatinem/rust-cache@842ef286fff290e445b90b4002cc9807c3669641 # v1.3.0
-      # End Enable Rust Caching
-
+      # Determine rust-toolchain version
+      - name: Init Variables
+        id: toolchain
+        shell: bash
+        if: ${{ matrix.channel == 'rust-toolchain' }}
+        run: |
+          RUST_TOOLCHAIN="$(cat rust-toolchain)"
+          echo "RUST_TOOLCHAIN=${RUST_TOOLCHAIN}" | tee -a "${GITHUB_OUTPUT}"
+      # End Determine rust-toolchain version
 
       # Uses the rust-toolchain file to determine version
-      - name: 'Install ${{ matrix.channel }}-${{ matrix.host-triple }} for target: ${{ matrix.target-triple }}'
-        uses: actions-rs/toolchain@b2417cde72dcf67f306c0ae8e0828a81bf0b189f # v1.0.6
+      - name: "Install rust-toolchain version"
+        uses: dtolnay/rust-toolchain@55c7845fad90d0ae8b2e83715cb900e5e861e8cb # master @ 2022-10-25 - 21:40 GMT+2
+        if: ${{ matrix.channel == 'rust-toolchain' }}
         with:
-          profile: minimal
-          target: ${{ matrix.target-triple }}
+          toolchain: "${{steps.toolchain.outputs.RUST_TOOLCHAIN}}"
           components: clippy, rustfmt
       # End Uses the rust-toolchain file to determine version
 
 
+      # Install the MSRV channel to be used
+      - name: "Install MSRV version"
+        uses: dtolnay/rust-toolchain@55c7845fad90d0ae8b2e83715cb900e5e861e8cb # master @ 2022-10-25 - 21:40 GMT+2
+        if: ${{ matrix.channel != 'rust-toolchain' }}
+        with:
+          toolchain: ${{ matrix.version }}
+      # End Install the MSRV channel to be used
+
+
+      # Enable Rust Caching
+      - uses: Swatinem/rust-cache@359a70e43a0bb8a13953b04a90f76428b4959bb6 # v2.2.0
+      # End Enable Rust Caching
+
+
+      # Show environment
+      - name: "Show environment"
+        run: |
+          rustc -vV
+          cargo -vV
+      # End Show environment
+
+
       # Run cargo tests (In release mode to speed up future builds)
       # First test all features together, afterwards test them separately.
-      - name: "`cargo test --release --features ${{ join(matrix.features, ',') }} --target ${{ matrix.target-triple }}`"
-        uses: actions-rs/cargo@844f36862e911db73fe0815f00a4a2602c279505 # v1.0.3
-        with:
-          command: test
-          args: --release --features ${{ join(matrix.features, ',') }} --target ${{ matrix.target-triple }}
-      # Test single features
-      # 0: sqlite
-      - name: "`cargo test --release --features ${{ matrix.features[0] }} --target ${{ matrix.target-triple }}`"
-        uses: actions-rs/cargo@844f36862e911db73fe0815f00a4a2602c279505 # v1.0.3
-        with:
-          command: test
-          args: --release --features ${{ matrix.features[0] }} --target ${{ matrix.target-triple }}
-        if: ${{ matrix.features[0] != '' }}
-      # 1: mysql
-      - name: "`cargo test --release --features ${{ matrix.features[1] }} --target ${{ matrix.target-triple }}`"
-        uses: actions-rs/cargo@844f36862e911db73fe0815f00a4a2602c279505 # v1.0.3
-        with:
-          command: test
-          args: --release --features ${{ matrix.features[1] }} --target ${{ matrix.target-triple }}
-        if: ${{ matrix.features[1] != '' }}
-      # 2: postgresql
-      - name: "`cargo test --release --features ${{ matrix.features[2] }} --target ${{ matrix.target-triple }}`"
-        uses: actions-rs/cargo@844f36862e911db73fe0815f00a4a2602c279505 # v1.0.3
-        with:
-          command: test
-          args: --release --features ${{ matrix.features[2] }} --target ${{ matrix.target-triple }}
-        if: ${{ matrix.features[2] != '' }}
+      - name: "test features: sqlite,mysql,postgresql,enable_mimalloc"
+        id: test_sqlite_mysql_postgresql_mimalloc
+        if: $${{ always() }}
+        run: |
+          cargo test --release --features sqlite,mysql,postgresql,enable_mimalloc
+
+      - name: "test features: sqlite,mysql,postgresql"
+        id: test_sqlite_mysql_postgresql
+        if: $${{ always() }}
+        run: |
+          cargo test --release --features sqlite,mysql,postgresql
+
+      - name: "test features: sqlite"
+        id: test_sqlite
+        if: $${{ always() }}
+        run: |
+          cargo test --release --features sqlite
+
+      - name: "test features: mysql"
+        id: test_mysql
+        if: $${{ always() }}
+        run: |
+          cargo test --release --features mysql
+
+      - name: "test features: postgresql"
+        id: test_postgresql
+        if: $${{ always() }}
+        run: |
+          cargo test --release --features postgresql
       # End Run cargo tests
 
 
       # Run cargo clippy, and fail on warnings (In release mode to speed up future builds)
-      - name: "`cargo clippy --release --features ${{ join(matrix.features, ',') }} --target ${{ matrix.target-triple }}`"
-        uses: actions-rs/cargo@844f36862e911db73fe0815f00a4a2602c279505 # v1.0.3
-        with:
-          command: clippy
-          args: --release --features ${{ join(matrix.features, ',') }} --target ${{ matrix.target-triple }} -- -D warnings
+      - name: "clippy features: sqlite,mysql,postgresql,enable_mimalloc"
+        id: clippy
+        if: ${{ always() && matrix.channel == 'rust-toolchain' }}
+        run: |
+          cargo clippy --release --features sqlite,mysql,postgresql,enable_mimalloc -- -D warnings
       # End Run cargo clippy
 
 
-      # Run cargo fmt
-      - name: '`cargo fmt`'
-        uses: actions-rs/cargo@844f36862e911db73fe0815f00a4a2602c279505 # v1.0.3
-        with:
-          command: fmt
-          args: --all -- --check
+      # Run cargo fmt (Only run on rust-toolchain defined version)
+      - name: "check formatting"
+        id: formatting
+        if: ${{ always() && matrix.channel == 'rust-toolchain' }}
+        run: |
+          cargo fmt --all -- --check
       # End Run cargo fmt
 
 
-      # Build the binary
-      - name: "`cargo build --release --features ${{ join(matrix.features, ',') }} --target ${{ matrix.target-triple }}`"
-        uses: actions-rs/cargo@844f36862e911db73fe0815f00a4a2602c279505 # v1.0.3
-        with:
-          command: build
-          args: --release --features ${{ join(matrix.features, ',') }} --target ${{ matrix.target-triple }}
+      # Check for any previous failures, if there are stop, else continue.
+      # This is useful so all test/clippy/fmt actions are done, and they can all be addressed
+      - name: "Some checks failed"
+        if: ${{ failure() }}
+        run: |
+          echo "### :x: Checks Failed!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "|Job|Status|" >> $GITHUB_STEP_SUMMARY
+          echo "|---|------|" >> $GITHUB_STEP_SUMMARY
+          echo "|test (sqlite,mysql,postgresql,enable_mimalloc)|${{ steps.test_sqlite_mysql_postgresql_mimalloc.outcome }}|" >> $GITHUB_STEP_SUMMARY
+          echo "|test (sqlite,mysql,postgresql)|${{ steps.test_sqlite_mysql_postgresql.outcome }}|" >> $GITHUB_STEP_SUMMARY
+          echo "|test (sqlite)|${{ steps.test_sqlite.outcome }}|" >> $GITHUB_STEP_SUMMARY
+          echo "|test (mysql)|${{ steps.test_mysql.outcome }}|" >> $GITHUB_STEP_SUMMARY
+          echo "|test (postgresql)|${{ steps.test_postgresql.outcome }}|" >> $GITHUB_STEP_SUMMARY
+          echo "|clippy (sqlite,mysql,postgresql,enable_mimalloc)|${{ steps.clippy.outcome }}|" >> $GITHUB_STEP_SUMMARY
+          echo "|fmt|${{ steps.formatting.outcome }}|" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Please check the failed jobs and fix where needed." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          exit 1
+
+
+      # Check for any previous failures, if there are stop, else continue.
+      # This is useful so all test/clippy/fmt actions are done, and they can all be addressed
+      - name: "All checks passed"
+        if: ${{ success() }}
+        run: |
+          echo "### :tada: Checks Passed!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+
+      # Build the binary to upload to the artifacts
+      - name: "build features: sqlite,mysql,postgresql"
+        if: ${{ matrix.channel == 'rust-toolchain' }}
+        run: |
+          cargo build --release --features sqlite,mysql,postgresql
       # End Build the binary
 
 
       # Upload artifact to Github Actions
-      - name: Upload artifact
-        uses: actions/upload-artifact@3cea5372237819ed00197afe530f5a7ea3e805c8 # v3.1.0
+      - name: "Upload artifact"
+        uses: actions/upload-artifact@83fd05a356d7e2593de66fc9913b3002723633cb # v3.1.1
+        if: ${{ matrix.channel == 'rust-toolchain' }}
         with:
-          name: vaultwarden-${{ matrix.target-triple }}${{ matrix.ext }}
-          path: target/${{ matrix.target-triple }}/release/vaultwarden${{ matrix.ext }}
+          name: vaultwarden
+          path: target/release/vaultwarden
       # End Upload artifact to Github Actions

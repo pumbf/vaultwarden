@@ -5,8 +5,8 @@ use rocket::Route;
 use serde_json::Value;
 
 use crate::{
-    api::{JsonResult, JsonUpcase, NumberOrString, PasswordData},
-    auth::Headers,
+    api::{core::log_user_event, JsonResult, JsonUpcase, NumberOrString, PasswordData},
+    auth::{ClientHeaders, ClientIp, Headers},
     crypto,
     db::{models::*, DbConn, DbPool},
     mail, CONFIG,
@@ -19,7 +19,14 @@ pub mod webauthn;
 pub mod yubikey;
 
 pub fn routes() -> Vec<Route> {
-    let mut routes = routes![get_twofactor, get_recover, recover, disable_twofactor, disable_twofactor_put,];
+    let mut routes = routes![
+        get_twofactor,
+        get_recover,
+        recover,
+        disable_twofactor,
+        disable_twofactor_put,
+        get_device_verification_settings,
+    ];
 
     routes.append(&mut authenticator::routes());
     routes.append(&mut duo::routes());
@@ -31,8 +38,8 @@ pub fn routes() -> Vec<Route> {
 }
 
 #[get("/two-factor")]
-async fn get_twofactor(headers: Headers, conn: DbConn) -> Json<Value> {
-    let twofactors = TwoFactor::find_by_user(&headers.user.uuid, &conn).await;
+async fn get_twofactor(headers: Headers, mut conn: DbConn) -> Json<Value> {
+    let twofactors = TwoFactor::find_by_user(&headers.user.uuid, &mut conn).await;
     let twofactors_json: Vec<Value> = twofactors.iter().map(TwoFactor::to_json_provider).collect();
 
     Json(json!({
@@ -66,13 +73,18 @@ struct RecoverTwoFactor {
 }
 
 #[post("/two-factor/recover", data = "<data>")]
-async fn recover(data: JsonUpcase<RecoverTwoFactor>, conn: DbConn) -> JsonResult {
+async fn recover(
+    data: JsonUpcase<RecoverTwoFactor>,
+    client_headers: ClientHeaders,
+    mut conn: DbConn,
+    ip: ClientIp,
+) -> JsonResult {
     let data: RecoverTwoFactor = data.into_inner().data;
 
     use crate::db::models::User;
 
     // Get the user
-    let mut user = match User::find_by_mail(&data.Email, &conn).await {
+    let mut user = match User::find_by_mail(&data.Email, &mut conn).await {
         Some(user) => user,
         None => err!("Username or password is incorrect. Try again."),
     };
@@ -88,17 +100,19 @@ async fn recover(data: JsonUpcase<RecoverTwoFactor>, conn: DbConn) -> JsonResult
     }
 
     // Remove all twofactors from the user
-    TwoFactor::delete_all_by_user(&user.uuid, &conn).await?;
+    TwoFactor::delete_all_by_user(&user.uuid, &mut conn).await?;
+
+    log_user_event(EventType::UserRecovered2fa as i32, &user.uuid, client_headers.device_type, &ip.ip, &mut conn).await;
 
     // Remove the recovery code, not needed without twofactors
     user.totp_recover = None;
-    user.save(&conn).await?;
+    user.save(&mut conn).await?;
     Ok(Json(json!({})))
 }
 
-async fn _generate_recover_code(user: &mut User, conn: &DbConn) {
+async fn _generate_recover_code(user: &mut User, conn: &mut DbConn) {
     if user.totp_recover.is_none() {
-        let totp_recover = BASE32.encode(&crypto::get_random(vec![0u8; 20]));
+        let totp_recover = crypto::encode_random_bytes::<20>(BASE32);
         user.totp_recover = Some(totp_recover);
         user.save(conn).await.ok();
     }
@@ -112,7 +126,12 @@ struct DisableTwoFactorData {
 }
 
 #[post("/two-factor/disable", data = "<data>")]
-async fn disable_twofactor(data: JsonUpcase<DisableTwoFactorData>, headers: Headers, conn: DbConn) -> JsonResult {
+async fn disable_twofactor(
+    data: JsonUpcase<DisableTwoFactorData>,
+    headers: Headers,
+    mut conn: DbConn,
+    ip: ClientIp,
+) -> JsonResult {
     let data: DisableTwoFactorData = data.into_inner().data;
     let password_hash = data.MasterPasswordHash;
     let user = headers.user;
@@ -123,24 +142,25 @@ async fn disable_twofactor(data: JsonUpcase<DisableTwoFactorData>, headers: Head
 
     let type_ = data.Type.into_i32()?;
 
-    if let Some(twofactor) = TwoFactor::find_by_user_and_type(&user.uuid, type_, &conn).await {
-        twofactor.delete(&conn).await?;
+    if let Some(twofactor) = TwoFactor::find_by_user_and_type(&user.uuid, type_, &mut conn).await {
+        twofactor.delete(&mut conn).await?;
+        log_user_event(EventType::UserDisabled2fa as i32, &user.uuid, headers.device.atype, &ip.ip, &mut conn).await;
     }
 
-    let twofactor_disabled = TwoFactor::find_by_user(&user.uuid, &conn).await.is_empty();
+    let twofactor_disabled = TwoFactor::find_by_user(&user.uuid, &mut conn).await.is_empty();
 
     if twofactor_disabled {
         for user_org in
-            UserOrganization::find_by_user_and_policy(&user.uuid, OrgPolicyType::TwoFactorAuthentication, &conn)
+            UserOrganization::find_by_user_and_policy(&user.uuid, OrgPolicyType::TwoFactorAuthentication, &mut conn)
                 .await
                 .into_iter()
         {
             if user_org.atype < UserOrgType::Admin {
                 if CONFIG.mail_enabled() {
-                    let org = Organization::find_by_uuid(&user_org.org_uuid, &conn).await.unwrap();
-                    mail::send_2fa_removed_from_org(&user.email, &org.name)?;
+                    let org = Organization::find_by_uuid(&user_org.org_uuid, &mut conn).await.unwrap();
+                    mail::send_2fa_removed_from_org(&user.email, &org.name).await?;
                 }
-                user_org.delete(&conn).await?;
+                user_org.delete(&mut conn).await?;
             }
         }
     }
@@ -153,8 +173,13 @@ async fn disable_twofactor(data: JsonUpcase<DisableTwoFactorData>, headers: Head
 }
 
 #[put("/two-factor/disable", data = "<data>")]
-async fn disable_twofactor_put(data: JsonUpcase<DisableTwoFactorData>, headers: Headers, conn: DbConn) -> JsonResult {
-    disable_twofactor(data, headers, conn).await
+async fn disable_twofactor_put(
+    data: JsonUpcase<DisableTwoFactorData>,
+    headers: Headers,
+    conn: DbConn,
+    ip: ClientIp,
+) -> JsonResult {
+    disable_twofactor(data, headers, conn, ip).await
 }
 
 pub async fn send_incomplete_2fa_notifications(pool: DbPool) {
@@ -164,7 +189,7 @@ pub async fn send_incomplete_2fa_notifications(pool: DbPool) {
         return;
     }
 
-    let conn = match pool.get().await {
+    let mut conn = match pool.get().await {
         Ok(conn) => conn,
         _ => {
             error!("Failed to get DB connection in send_incomplete_2fa_notifications()");
@@ -175,15 +200,34 @@ pub async fn send_incomplete_2fa_notifications(pool: DbPool) {
     let now = Utc::now().naive_utc();
     let time_limit = Duration::minutes(CONFIG.incomplete_2fa_time_limit());
     let time_before = now - time_limit;
-    let incomplete_logins = TwoFactorIncomplete::find_logins_before(&time_before, &conn).await;
+    let incomplete_logins = TwoFactorIncomplete::find_logins_before(&time_before, &mut conn).await;
     for login in incomplete_logins {
-        let user = User::find_by_uuid(&login.user_uuid, &conn).await.expect("User not found");
+        let user = User::find_by_uuid(&login.user_uuid, &mut conn).await.expect("User not found");
         info!(
             "User {} did not complete a 2FA login within the configured time limit. IP: {}",
             user.email, login.ip_address
         );
         mail::send_incomplete_2fa_login(&user.email, &login.ip_address, &login.login_time, &login.device_name)
+            .await
             .expect("Error sending incomplete 2FA email");
-        login.delete(&conn).await.expect("Error deleting incomplete 2FA record");
+        login.delete(&mut conn).await.expect("Error deleting incomplete 2FA record");
     }
+}
+
+// This function currently is just a dummy and the actual part is not implemented yet.
+// This also prevents 404 errors.
+//
+// See the following Bitwarden PR's regarding this feature.
+// https://github.com/bitwarden/clients/pull/2843
+// https://github.com/bitwarden/clients/pull/2839
+// https://github.com/bitwarden/server/pull/2016
+//
+// The HTML part is hidden via the CSS patches done via the bw_web_build repo
+#[get("/two-factor/get-device-verification-settings")]
+fn get_device_verification_settings(_headers: Headers, _conn: DbConn) -> Json<Value> {
+    Json(json!({
+        "isDeviceVerificationSectionEnabled":false,
+        "unknownDeviceVerificationEnabled":false,
+        "object":"deviceVerificationSettings"
+    }))
 }

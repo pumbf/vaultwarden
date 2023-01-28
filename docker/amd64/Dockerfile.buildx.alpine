@@ -16,18 +16,18 @@
 # - From https://hub.docker.com/r/vaultwarden/web-vault/tags,
 #   click the tag name to view the digest of the image it currently points to.
 # - From the command line:
-#     $ docker pull vaultwarden/web-vault:v2.28.1
-#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2.28.1
-#     [vaultwarden/web-vault@sha256:df7f12b1e22bf0dfc1b6b6f46921b4e9e649561931ba65357c1eb1963514b3b5]
+#     $ docker pull vaultwarden/web-vault:v2023.1.1
+#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2023.1.1
+#     [vaultwarden/web-vault@sha256:d5f71fb05c4b87935bf51d84140db0f8716cabfe2974fbee6c0c5ee8cf7dab5a]
 #
 # - Conversely, to get the tag name from the digest:
-#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:df7f12b1e22bf0dfc1b6b6f46921b4e9e649561931ba65357c1eb1963514b3b5
-#     [vaultwarden/web-vault:v2.28.1]
+#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:d5f71fb05c4b87935bf51d84140db0f8716cabfe2974fbee6c0c5ee8cf7dab5a
+#     [vaultwarden/web-vault:v2023.1.1]
 #
-FROM vaultwarden/web-vault@sha256:df7f12b1e22bf0dfc1b6b6f46921b4e9e649561931ba65357c1eb1963514b3b5 as vault
+FROM vaultwarden/web-vault@sha256:d5f71fb05c4b87935bf51d84140db0f8716cabfe2974fbee6c0c5ee8cf7dab5a as vault
 
 ########################## BUILD IMAGE  ##########################
-FROM blackdex/rust-musl:x86_64-musl-stable-1.61.0 as build
+FROM blackdex/rust-musl:x86_64-musl-stable-1.66.1 as build
 
 
 
@@ -78,18 +78,10 @@ RUN touch src/main.rs
 # hadolint ignore=DL3059
 RUN --mount=type=cache,target=/root/.cargo/git --mount=type=cache,target=/root/.cargo/registry cargo build --features ${DB} --release --target=x86_64-unknown-linux-musl
 
-# Create a special empty file which we check within the application.
-# If this file exists, then we exit Vaultwarden to prevent data loss when someone forgets to use volumes.
-# If you really really want to use volatile storage you can set the env `I_REALLY_WANT_VOLATILE_STORAGE=true`
-# This file should disappear if a volume is mounted on-top of this using a docker volume.
-# We run this in the build image and copy it over, because the runtime image could be missing some executables.
-# hadolint ignore=DL3059
-RUN touch /vaultwarden_docker_persistent_volume_check
-
 ######################## RUNTIME IMAGE  ########################
 # Create a new stage with a minimal image
 # because we already have a binary built
-FROM alpine:3.15
+FROM alpine:3.17
 
 ENV ROCKET_PROFILE="release" \
     ROCKET_ADDRESS=0.0.0.0 \
@@ -104,7 +96,6 @@ RUN mkdir /data \
         openssl \
         tzdata \
         curl \
-        dumb-init \
         ca-certificates
 
 
@@ -116,7 +107,6 @@ EXPOSE 3012
 # and the binary from the "build" stage to the current stage
 WORKDIR /
 COPY --from=vault /web-vault ./web-vault
-COPY --from=build /vaultwarden_docker_persistent_volume_check /data/vaultwarden_docker_persistent_volume_check
 COPY --from=build /app/target/x86_64-unknown-linux-musl/release/vaultwarden .
 
 COPY docker/healthcheck.sh /healthcheck.sh
@@ -124,10 +114,4 @@ COPY docker/start.sh /start.sh
 
 HEALTHCHECK --interval=60s --timeout=10s CMD ["/healthcheck.sh"]
 
-# Configures the startup!
-# We should be able to remove the dumb-init now with Rocket 0.5
-# But the balenalib images have some issues with there entry.sh
-# See: https://github.com/balena-io-library/base-images/issues/735
-# Lets keep using dumb-init for now, since that is working fine.
-ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 CMD ["/start.sh"]

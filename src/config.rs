@@ -1,6 +1,7 @@
 use std::process::exit;
 use std::sync::RwLock;
 
+use job_scheduler_ng::Schedule;
 use once_cell::sync::Lazy;
 use reqwest::Url;
 
@@ -12,12 +13,12 @@ use crate::{
 
 static CONFIG_FILE: Lazy<String> = Lazy::new(|| {
     let data_folder = get_env("DATA_FOLDER").unwrap_or_else(|| String::from("data"));
-    get_env("CONFIG_FILE").unwrap_or_else(|| format!("{}/config.json", data_folder))
+    get_env("CONFIG_FILE").unwrap_or_else(|| format!("{data_folder}/config.json"))
 });
 
 pub static CONFIG: Lazy<Config> = Lazy::new(|| {
     Config::load().unwrap_or_else(|e| {
-        println!("Error loading config:\n\t{:?}\n", e);
+        println!("Error loading config:\n\t{e:?}\n");
         exit(12)
     })
 });
@@ -37,7 +38,7 @@ macro_rules! make_config {
 
         struct Inner {
             rocket_shutdown_handle: Option<rocket::Shutdown>,
-            ws_shutdown_handle: Option<ws::Sender>,
+            ws_shutdown_handle: Option<tokio::sync::oneshot::Sender<()>>,
 
             templates: Handlebars<'static>,
             config: ConfigItems,
@@ -59,40 +60,52 @@ macro_rules! make_config {
         impl ConfigBuilder {
             #[allow(clippy::field_reassign_with_default)]
             fn from_env() -> Self {
-                match dotenvy::from_path(get_env("ENV_FILE").unwrap_or_else(|| String::from(".env"))) {
-                    Ok(_) => (),
+                let env_file = get_env("ENV_FILE").unwrap_or_else(|| String::from(".env"));
+                match dotenvy::from_path(&env_file) {
+                    Ok(_) => {
+                        println!("[INFO] Using environment file `{env_file}` for configuration.\n");
+                    },
                     Err(e) => match e {
                         dotenvy::Error::LineParse(msg, pos) => {
-                            panic!("Error loading the .env file:\nNear {:?} on position {}\nPlease fix and restart!\n", msg, pos);
+                            println!("[ERROR] Failed parsing environment file: `{env_file}`\nNear {msg:?} on position {pos}\nPlease fix and restart!\n");
+                            exit(255);
                         },
                         dotenvy::Error::Io(ioerr) => match ioerr.kind() {
                             std::io::ErrorKind::NotFound => {
-                                println!("[INFO] No .env file found.\n");
+                                // Only exit if this environment variable is set, but the file was not found.
+                                // This prevents incorrectly configured environments.
+                                if let Some(env_file) = get_env::<String>("ENV_FILE") {
+                                    println!("[ERROR] The configured ENV_FILE `{env_file}` was not found!\n");
+                                    exit(255);
+                                }
                             },
                             std::io::ErrorKind::PermissionDenied => {
-                                println!("[WARNING] Permission Denied while trying to read the .env file!\n");
+                                println!("[ERROR] Permission denied while trying to read environment file `{env_file}`!\n");
+                                exit(255);
                             },
                             _ => {
-                                println!("[WARNING] Reading the .env file failed:\n{:?}\n", ioerr);
+                                println!("[ERROR] Reading environment file `{env_file}` failed:\n{ioerr:?}\n");
+                                exit(255);
                             }
                         },
                         _ => {
-                            println!("[WARNING] Reading the .env file failed:\n{:?}\n", e);
+                            println!("[ERROR] Reading environment file `{env_file}` failed:\n{e:?}\n");
+                            exit(255);
                         }
                     }
                 };
 
                 let mut builder = ConfigBuilder::default();
                 $($(
-                    builder.$name = make_config! { @getenv &stringify!($name).to_uppercase(), $ty };
+                    builder.$name = make_config! { @getenv paste::paste!(stringify!([<$name:upper>])), $ty };
                 )+)+
 
                 builder
             }
 
             fn from_file(path: &str) -> Result<Self, Error> {
-                use crate::util::read_file_string;
-                let config_str = read_file_string(path)?;
+                let config_str = std::fs::read_to_string(path)?;
+                println!("[INFO] Using saved config from `{path}` for configuration.\n");
                 serde_json::from_str(&config_str).map_err(Into::into)
             }
 
@@ -105,15 +118,15 @@ macro_rules! make_config {
                         builder.$name = v.clone();
 
                         if self.$name.is_some() {
-                            overrides.push(stringify!($name).to_uppercase());
+                            overrides.push(paste::paste!(stringify!([<$name:upper>])).into());
                         }
                     }
                 )+)+
 
                 if show_overrides && !overrides.is_empty() {
                     // We can't use warn! here because logging isn't setup yet.
-                    println!("[WARNING] The following environment variables are being overriden by the config file,");
-                    println!("[WARNING] please use the admin panel to make changes to them:");
+                    println!("[WARNING] The following environment variables are being overriden by the config.json file.");
+                    println!("[WARNING] Please use the admin panel to make changes to them:");
                     println!("[WARNING] {}\n", overrides.join(", "));
                 }
 
@@ -195,7 +208,7 @@ macro_rules! make_config {
                                 element.insert("default".into(), serde_json::to_value(def.$name).unwrap());
                                 element.insert("type".into(), (_get_form_type(stringify!($ty))).into());
                                 element.insert("doc".into(), (_get_doc(concat!($($doc),+))).into());
-                                element.insert("overridden".into(), (overriden.contains(&stringify!($name).to_uppercase())).into());
+                                element.insert("overridden".into(), (overriden.contains(&paste::paste!(stringify!([<$name:upper>])).into())).into());
                                 element
                             }),
                         )+
@@ -232,14 +245,23 @@ macro_rules! make_config {
                 /// We map over the string and remove all alphanumeric, _ and - characters.
                 /// This is the fastest way (within micro-seconds) instead of using a regex (which takes mili-seconds)
                 fn _privacy_mask(value: &str) -> String {
-                    value.chars().map(|c|
-                        match c {
-                            c if c.is_alphanumeric() => '*',
-                            '_' => '*',
-                            '-' => '*',
-                            _ => c
-                        }
-                    ).collect::<String>()
+                    let mut n: u16 = 0;
+                    let mut colon_match = false;
+                    value
+                        .chars()
+                        .map(|c| {
+                            n += 1;
+                            match c {
+                                ':' if n <= 11 => {
+                                    colon_match = true;
+                                    c
+                                }
+                                '/' if n <= 13 && colon_match => c,
+                                ',' => c,
+                                _ => '*',
+                            }
+                        })
+                        .collect::<String>()
                 }
 
                 serde_json::Value::Object({
@@ -366,11 +388,14 @@ make_config! {
         /// Defaults to once every minute. Set blank to disable this job.
         incomplete_2fa_schedule: String, false,  def,   "30 * * * * *".to_string();
         /// Emergency notification reminder schedule |> Cron schedule of the job that sends expiration reminders to emergency access grantors.
-        /// Defaults to hourly. Set blank to disable this job.
-        emergency_notification_reminder_schedule:   String, false,  def,    "0 5 * * * *".to_string();
+        /// Defaults to hourly. (3 minutes after the hour) Set blank to disable this job.
+        emergency_notification_reminder_schedule:   String, false,  def,    "0 3 * * * *".to_string();
         /// Emergency request timeout schedule |> Cron schedule of the job that grants emergency access requests that have met the required wait time.
-        /// Defaults to hourly. Set blank to disable this job.
-        emergency_request_timeout_schedule:   String, false,  def,    "0 5 * * * *".to_string();
+        /// Defaults to hourly. (7 minutes after the hour) Set blank to disable this job.
+        emergency_request_timeout_schedule:   String, false,  def,    "0 7 * * * *".to_string();
+        /// Event cleanup schedule |> Cron schedule of the job that cleans old events from the event table.
+        /// Defaults to daily. Set blank to disable this job.
+        event_cleanup_schedule:   String, false,  def,    "0 10 0 * * *".to_string();
     },
 
     /// General settings
@@ -425,17 +450,24 @@ make_config! {
         /// If signups require email verification, limit how many emails are automatically sent when login is attempted (0 means no limit)
         signups_verify_resend_limit: u32, true, def,    6;
         /// Email domain whitelist |> Allow signups only from this list of comma-separated domains, even when signups are otherwise disabled
-        signups_domains_whitelist: String, true, def,   "".to_string();
+        signups_domains_whitelist: String, true, def,   String::new();
+        /// Enable event logging |> Enables event logging for organizations.
+        org_events_enabled:     bool,   false,  def,    false;
         /// Org creation users |> Allow org creation only by this list of comma-separated user emails.
         /// Blank or 'all' means all users can create orgs; 'none' means no users can create orgs.
-        org_creation_users:     String, true,   def,    "".to_string();
+        org_creation_users:     String, true,   def,    String::new();
         /// Allow invitations |> Controls whether users can be invited by organization admins, even when signups are otherwise disabled
         invitations_allowed:    bool,   true,   def,    true;
+        /// Invitation token expiration time (in hours) |> The number of hours after which an organization invite token, emergency access invite token,
+        /// email verification token and deletion request token will expire (must be at least 1)
+        invitation_expiration_hours: u32, false, def, 120;
         /// Allow emergency access |> Controls whether users can enable emergency access to their accounts. This setting applies globally to all users.
         emergency_access_allowed:    bool,   true,   def,    true;
-        /// Password iterations |> Number of server-side passwords hashing iterations.
-        /// The changes only apply when a user changes their password. Not recommended to lower the value
-        password_iterations:    i32,    true,   def,    100_000;
+        /// Password iterations |> Number of server-side passwords hashing iterations for the password hash.
+        /// The default for new users. If changed, it will be updated during login for existing users.
+        password_iterations:    i32,    true,   def,    600_000;
+        /// Allow password hints |> Controls whether users can set password hints. This setting applies globally to all users.
+        password_hints_allowed: bool,   true,   def,    true;
         /// Show password hint |> Controls whether a password hint should be shown directly in the web page
         /// if SMTP service is not configured. Not recommended for publicly-accessible instances as this
         /// provides unauthenticated access to potentially sensitive data.
@@ -446,6 +478,9 @@ make_config! {
 
         /// Invitation organization name |> Name shown in the invitation emails that don't come from a specific organization
         invitation_org_name:    String, true,   def,    "Vaultwarden".to_string();
+
+        /// Events days retain |> Number of days to retain events stored in the database. If unset, events are kept indefently.
+        events_days_retain:     i64,    false,   option;
     },
 
     /// Advanced settings
@@ -462,6 +497,10 @@ make_config! {
         /// service is set, an icon request to Vaultwarden will return an HTTP redirect to the
         /// corresponding icon at the external service.
         icon_service:           String, false,  def,    "internal".to_string();
+        /// _icon_service_url
+        _icon_service_url:      String, false,  gen,    |c| generate_icon_service_url(&c.icon_service);
+        /// _icon_service_csp
+        _icon_service_csp:      String, false,  gen,    |c| generate_icon_service_csp(&c.icon_service, &c._icon_service_url);
         /// Icon redirect code |> The HTTP status code to use for redirects to an external icon service.
         /// The supported codes are 301 (legacy permanent), 302 (legacy temporary), 307 (temporary), and 308 (permanent).
         /// Temporary redirects are useful while testing different icon services, but once a service
@@ -521,10 +560,10 @@ make_config! {
         database_max_conns:     u32,    false,  def,    10;
 
         /// Database connection init |> SQL statements to run when creating a new database connection, mainly useful for connection-scoped pragmas. If empty, a database-specific default is used.
-        database_conn_init:     String, false,  def,    "".to_string();
+        database_conn_init:     String, false,  def,    String::new();
 
         /// Bypass admin page security (Know the risks!) |> Disables the Admin Token for the admin page so you may use your own auth in-front
-        disable_admin_token:    bool,   true,   def,    false;
+        disable_admin_token:    bool,   false,  def,    false;
 
         /// Allowed iframe ancestors (Know the risks!) |> Allows other domains to embed the web vault into an iframe, useful for embedding into secure intranets
         allowed_iframe_ancestors: String, true, def,    String::new();
@@ -534,10 +573,13 @@ make_config! {
         /// Max burst size for login requests |> Allow a burst of requests of up to this size, while maintaining the average indicated by `login_ratelimit_seconds`. Note that this applies to both the login and the 2FA, so it's recommended to allow a burst size of at least 2
         login_ratelimit_max_burst:     u32, false, def, 10;
 
-        /// Seconds between admin requests |> Number of seconds, on average, between admin requests from the same IP address before rate limiting kicks in
+        /// Seconds between admin login requests |> Number of seconds, on average, between admin requests from the same IP address before rate limiting kicks in
         admin_ratelimit_seconds:       u64, false, def, 300;
-        /// Max burst size for login requests |> Allow a burst of requests of up to this size, while maintaining the average indicated by `admin_ratelimit_seconds`
+        /// Max burst size for admin login requests |> Allow a burst of requests of up to this size, while maintaining the average indicated by `admin_ratelimit_seconds`
         admin_ratelimit_max_burst:     u32, false, def, 3;
+
+        /// Enable groups (BETA!) (Know the risks!) |> Enables groups support for organizations (Currently contains known issues!).
+        org_groups_enabled:     bool,   false,  def,    false;
     },
 
     /// Yubikey settings
@@ -594,6 +636,10 @@ make_config! {
         smtp_timeout:                  u64,    true,   def,     15;
         /// Server name sent during HELO |> By default this value should be is on the machine's hostname, but might need to be changed in case it trips some anti-spam filters
         helo_name:                     String, true,   option;
+        /// Embed images as email attachments.
+        smtp_embed_images:             bool, true, def, true;
+        /// _smtp_img_src
+        _smtp_img_src:                 String, false, gen, |c| generate_smtp_img_src(c.smtp_embed_images, &c.domain);
         /// Enable SMTP debugging (Know the risks!) |> DANGEROUS: Enabling this will output very detailed SMTP messages. This could contain sensitive information like passwords and usernames! Only enable this during troubleshooting!
         smtp_debug:                    bool,   false,  def,     false;
         /// Accept Invalid Certs (Know the risks!) |> DANGEROUS: Allow invalid certificates. This option introduces significant vulnerabilities to man-in-the-middle attacks!
@@ -617,11 +663,29 @@ make_config! {
 
 fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
     // Validate connection URL is valid and DB feature is enabled
-    DbConnType::from_url(&cfg.database_url)?;
+    let url = &cfg.database_url;
+    if DbConnType::from_url(url)? == DbConnType::sqlite && url.contains('/') {
+        let path = std::path::Path::new(&url);
+        if let Some(parent) = path.parent() {
+            if !parent.is_dir() {
+                err!(format!("SQLite database directory `{}` does not exist or is not a directory", parent.display()));
+            }
+        }
+    }
+
+    if cfg.password_iterations < 100_000 {
+        err!("PASSWORD_ITERATIONS should be at least 100000 or higher. The default is 600000!");
+    }
 
     let limit = 256;
     if cfg.database_max_conns < 1 || cfg.database_max_conns > limit {
-        err!(format!("`DATABASE_MAX_CONNS` contains an invalid value. Ensure it is between 1 and {}.", limit,));
+        err!(format!("`DATABASE_MAX_CONNS` contains an invalid value. Ensure it is between 1 and {limit}.",));
+    }
+
+    if let Some(log_file) = &cfg.log_file {
+        if std::fs::OpenOptions::new().append(true).create(true).open(log_file).is_err() {
+            err!("Unable to write to log file", log_file);
+        }
     }
 
     let dom = cfg.domain.to_lowercase();
@@ -657,8 +721,17 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
         err!("All Duo options need to be set for global Duo support")
     }
 
-    if cfg._enable_yubico && cfg.yubico_client_id.is_some() != cfg.yubico_secret_key.is_some() {
-        err!("Both `YUBICO_CLIENT_ID` and `YUBICO_SECRET_KEY` need to be set for Yubikey OTP support")
+    if cfg._enable_yubico {
+        if cfg.yubico_client_id.is_some() != cfg.yubico_secret_key.is_some() {
+            err!("Both `YUBICO_CLIENT_ID` and `YUBICO_SECRET_KEY` must be set for Yubikey OTP support")
+        }
+
+        if let Some(yubico_server) = &cfg.yubico_server {
+            let yubico_server = yubico_server.to_lowercase();
+            if !yubico_server.starts_with("https://") {
+                err!("`YUBICO_SERVER` must be a valid URL and start with 'https://'. Either unset this variable or provide a valid URL.")
+            }
+        }
     }
 
     if cfg._enable_smtp {
@@ -695,7 +768,7 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
         let validate_regex = regex::Regex::new(r);
         match validate_regex {
             Ok(_) => (),
-            Err(e) => err!(format!("`ICON_BLACKLIST_REGEX` is invalid: {:#?}", e)),
+            Err(e) => err!(format!("`ICON_BLACKLIST_REGEX` is invalid: {e:#?}")),
         }
     }
 
@@ -705,12 +778,12 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
         "internal" | "bitwarden" | "duckduckgo" | "google" => (),
         _ => {
             if !icon_service.starts_with("http") {
-                err!(format!("Icon service URL `{}` must start with \"http\"", icon_service))
+                err!(format!("Icon service URL `{icon_service}` must start with \"http\""))
             }
             match icon_service.matches("{}").count() {
                 1 => (), // nominal
-                0 => err!(format!("Icon service URL `{}` has no placeholder \"{{}}\"", icon_service)),
-                _ => err!(format!("Icon service URL `{}` has more than one placeholder \"{{}}\"", icon_service)),
+                0 => err!(format!("Icon service URL `{icon_service}` has no placeholder \"{{}}\"")),
+                _ => err!(format!("Icon service URL `{icon_service}` has more than one placeholder \"{{}}\"")),
             }
         }
     }
@@ -721,6 +794,39 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
         _ => err!("Only HTTP 301/302 and 307/308 redirects are supported"),
     }
 
+    if cfg.invitation_expiration_hours < 1 {
+        err!("`INVITATION_EXPIRATION_HOURS` has a minimum duration of 1 hour")
+    }
+
+    // Validate schedule crontab format
+    if !cfg.send_purge_schedule.is_empty() && cfg.send_purge_schedule.parse::<Schedule>().is_err() {
+        err!("`SEND_PURGE_SCHEDULE` is not a valid cron expression")
+    }
+
+    if !cfg.trash_purge_schedule.is_empty() && cfg.trash_purge_schedule.parse::<Schedule>().is_err() {
+        err!("`TRASH_PURGE_SCHEDULE` is not a valid cron expression")
+    }
+
+    if !cfg.incomplete_2fa_schedule.is_empty() && cfg.incomplete_2fa_schedule.parse::<Schedule>().is_err() {
+        err!("`INCOMPLETE_2FA_SCHEDULE` is not a valid cron expression")
+    }
+
+    if !cfg.emergency_notification_reminder_schedule.is_empty()
+        && cfg.emergency_notification_reminder_schedule.parse::<Schedule>().is_err()
+    {
+        err!("`EMERGENCY_NOTIFICATION_REMINDER_SCHEDULE` is not a valid cron expression")
+    }
+
+    if !cfg.emergency_request_timeout_schedule.is_empty()
+        && cfg.emergency_request_timeout_schedule.parse::<Schedule>().is_err()
+    {
+        err!("`EMERGENCY_REQUEST_TIMEOUT_SCHEDULE` is not a valid cron expression")
+    }
+
+    if !cfg.event_cleanup_schedule.is_empty() && cfg.event_cleanup_schedule.parse::<Schedule>().is_err() {
+        err!("`EVENT_CLEANUP_SCHEDULE` is not a valid cron expression")
+    }
+
     Ok(())
 }
 
@@ -729,7 +835,7 @@ fn extract_url_origin(url: &str) -> String {
     match Url::parse(url) {
         Ok(u) => u.origin().ascii_serialization(),
         Err(e) => {
-            println!("Error validating domain: {}", e);
+            println!("Error validating domain: {e}");
             String::new()
         }
     }
@@ -744,6 +850,42 @@ fn extract_url_path(url: &str) -> String {
             // We already print it in the method above, no need to do it again
             String::new()
         }
+    }
+}
+
+fn generate_smtp_img_src(embed_images: bool, domain: &str) -> String {
+    if embed_images {
+        "cid:".to_string()
+    } else {
+        format!("{domain}/vw_static/")
+    }
+}
+
+/// Generate the correct URL for the icon service.
+/// This will be used within icons.rs to call the external icon service.
+fn generate_icon_service_url(icon_service: &str) -> String {
+    match icon_service {
+        "internal" => String::new(),
+        "bitwarden" => "https://icons.bitwarden.net/{}/icon.png".to_string(),
+        "duckduckgo" => "https://icons.duckduckgo.com/ip3/{}.ico".to_string(),
+        "google" => "https://www.google.com/s2/favicons?domain={}&sz=32".to_string(),
+        _ => icon_service.to_string(),
+    }
+}
+
+/// Generate the CSP string needed to allow redirected icon fetching
+fn generate_icon_service_csp(icon_service: &str, icon_service_url: &str) -> String {
+    // We split on the first '{', since that is the variable delimiter for an icon service URL.
+    // Everything up until the first '{' should be fixed and can be used as an CSP string.
+    let csp_string = match icon_service_url.split_once('{') {
+        Some((c, _)) => c.to_string(),
+        None => String::new(),
+    };
+
+    // Because Google does a second redirect to there gstatic.com domain, we need to add an extra csp string.
+    match icon_service {
+        "google" => csp_string + " https://*.gstatic.com/favicon",
+        _ => csp_string,
     }
 }
 
@@ -908,8 +1050,7 @@ impl Config {
         if let Some(akey) = self._duo_akey() {
             akey
         } else {
-            let akey = crate::crypto::get_random_64();
-            let akey_s = data_encoding::BASE64.encode(&akey);
+            let akey_s = crate::crypto::encode_random_bytes::<64>(data_encoding::BASE64);
 
             // Save the new value
             let builder = ConfigBuilder {
@@ -948,19 +1089,17 @@ impl Config {
         self.inner.write().unwrap().rocket_shutdown_handle = Some(handle);
     }
 
-    pub fn set_ws_shutdown_handle(&self, handle: ws::Sender) {
+    pub fn set_ws_shutdown_handle(&self, handle: tokio::sync::oneshot::Sender<()>) {
         self.inner.write().unwrap().ws_shutdown_handle = Some(handle);
     }
 
     pub fn shutdown(&self) {
-        if let Ok(c) = self.inner.read() {
-            if let Some(handle) = c.ws_shutdown_handle.clone() {
-                handle.shutdown().ok();
+        if let Ok(mut c) = self.inner.write() {
+            if let Some(handle) = c.ws_shutdown_handle.take() {
+                handle.send(()).ok();
             }
-            // Wait a bit before stopping the web server
-            tokio::runtime::Handle::current()
-                .block_on(async move { tokio::time::sleep(tokio::time::Duration::from_secs(1)).await });
-            if let Some(handle) = c.rocket_shutdown_handle.clone() {
+
+            if let Some(handle) = c.rocket_shutdown_handle.take() {
                 handle.notify();
             }
         }
@@ -979,6 +1118,7 @@ where
     // Register helpers
     hb.register_helper("case", Box::new(case_helper));
     hb.register_helper("jsesc", Box::new(js_escape_helper));
+    hb.register_helper("to_json", Box::new(to_json));
 
     macro_rules! reg {
         ($name:expr) => {{
@@ -1028,6 +1168,8 @@ where
     reg!("admin/organizations");
     reg!("admin/diagnostics");
 
+    reg!("404");
+
     // And then load user templates to overwrite the defaults
     // Use .hbs extension for the files
     // Templates get registered with their relative name
@@ -1047,7 +1189,7 @@ fn case_helper<'reg, 'rc>(
     let value = param.value().clone();
 
     if h.params().iter().skip(1).any(|x| x.value() == &value) {
-        h.template().map(|t| t.render(r, ctx, rc, out)).unwrap_or(Ok(()))
+        h.template().map(|t| t.render(r, ctx, rc, out)).unwrap_or_else(|| Ok(()))
     } else {
         Ok(())
     }
@@ -1060,18 +1202,31 @@ fn js_escape_helper<'reg, 'rc>(
     _rc: &mut RenderContext<'reg, 'rc>,
     out: &mut dyn Output,
 ) -> HelperResult {
-    let param = h.param(0).ok_or_else(|| RenderError::new("Param not found for helper \"js_escape\""))?;
+    let param = h.param(0).ok_or_else(|| RenderError::new("Param not found for helper \"jsesc\""))?;
 
     let no_quote = h.param(1).is_some();
 
-    let value =
-        param.value().as_str().ok_or_else(|| RenderError::new("Param for helper \"js_escape\" is not a String"))?;
+    let value = param.value().as_str().ok_or_else(|| RenderError::new("Param for helper \"jsesc\" is not a String"))?;
 
     let mut escaped_value = value.replace('\\', "").replace('\'', "\\x22").replace('\"', "\\x27");
     if !no_quote {
-        escaped_value = format!("&quot;{}&quot;", escaped_value);
+        escaped_value = format!("&quot;{escaped_value}&quot;");
     }
 
     out.write(&escaped_value)?;
+    Ok(())
+}
+
+fn to_json<'reg, 'rc>(
+    h: &Helper<'reg, 'rc>,
+    _r: &'reg Handlebars<'_>,
+    _ctx: &'rc Context,
+    _rc: &mut RenderContext<'reg, 'rc>,
+    out: &mut dyn Output,
+) -> HelperResult {
+    let param = h.param(0).ok_or_else(|| RenderError::new("Expected 1 parameter for \"to_json\""))?.value();
+    let json = serde_json::to_string(param)
+        .map_err(|e| RenderError::new(format!("Can't serialize parameter to JSON: {e}")))?;
+    out.write(&json)?;
     Ok(())
 }

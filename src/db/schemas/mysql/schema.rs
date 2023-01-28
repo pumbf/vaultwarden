@@ -56,6 +56,27 @@ table! {
 }
 
 table! {
+    event (uuid) {
+        uuid -> Varchar,
+        event_type -> Integer,
+        user_uuid -> Nullable<Varchar>,
+        org_uuid -> Nullable<Varchar>,
+        cipher_uuid -> Nullable<Varchar>,
+        collection_uuid -> Nullable<Varchar>,
+        group_uuid -> Nullable<Varchar>,
+        org_user_uuid -> Nullable<Varchar>,
+        act_user_uuid -> Nullable<Varchar>,
+        device_type -> Nullable<Integer>,
+        ip_address -> Nullable<Text>,
+        event_date -> Timestamp,
+        policy_uuid -> Nullable<Varchar>,
+        provider_uuid -> Nullable<Varchar>,
+        provider_user_uuid -> Nullable<Varchar>,
+        provider_org_uuid -> Nullable<Varchar>,
+    }
+}
+
+table! {
     favorites (user_uuid, cipher_uuid) {
         user_uuid -> Text,
         cipher_uuid -> Text,
@@ -179,6 +200,7 @@ table! {
         client_kdf_type -> Integer,
         client_kdf_iter -> Integer,
         api_key -> Nullable<Text>,
+        avatar_color -> Nullable<Text>,
     }
 }
 
@@ -220,6 +242,34 @@ table! {
     }
 }
 
+table! {
+    groups (uuid) {
+        uuid -> Text,
+        organizations_uuid -> Text,
+        name -> Text,
+        access_all -> Bool,
+        external_id -> Nullable<Text>,
+        creation_date -> Timestamp,
+        revision_date -> Timestamp,
+    }
+}
+
+table! {
+    groups_users (groups_uuid, users_organizations_uuid) {
+        groups_uuid -> Text,
+        users_organizations_uuid -> Text,
+    }
+}
+
+table! {
+    collections_groups (collections_uuid, groups_uuid) {
+        collections_uuid -> Text,
+        groups_uuid -> Text,
+        read_only -> Bool,
+        hide_passwords -> Bool,
+    }
+}
+
 joinable!(attachments -> ciphers (cipher_uuid));
 joinable!(ciphers -> organizations (organization_uuid));
 joinable!(ciphers -> users (user_uuid));
@@ -239,6 +289,12 @@ joinable!(users_collections -> users (user_uuid));
 joinable!(users_organizations -> organizations (org_uuid));
 joinable!(users_organizations -> users (user_uuid));
 joinable!(emergency_access -> users (grantor_uuid));
+joinable!(groups -> organizations (organizations_uuid));
+joinable!(groups_users -> users_organizations (users_organizations_uuid));
+joinable!(groups_users -> groups (groups_uuid));
+joinable!(collections_groups -> collections (collections_uuid));
+joinable!(collections_groups -> groups (groups_uuid));
+joinable!(event -> users_organizations (uuid));
 
 allow_tables_to_appear_in_same_query!(
     attachments,
@@ -257,4 +313,8 @@ allow_tables_to_appear_in_same_query!(
     users_collections,
     users_organizations,
     emergency_access,
+    groups,
+    groups_users,
+    collections_groups,
+    event,
 );

@@ -75,12 +75,10 @@ macro_rules! generate_connections {
         #[cfg($name)]
         impl CustomizeConnection<$ty, diesel::r2d2::Error> for DbConnOptions {
             fn on_acquire(&self, conn: &mut $ty) -> Result<(), diesel::r2d2::Error> {
-                (|| {
-                    if !self.init_stmts.is_empty() {
-                        conn.batch_execute(&self.init_stmts)?;
-                    }
-                    Ok(())
-                })().map_err(diesel::r2d2::Error::QueryError)
+                if !self.init_stmts.is_empty() {
+                    conn.batch_execute(&self.init_stmts).map_err(diesel::r2d2::Error::QueryError)?;
+                }
+                Ok(())
             }
         })+
 
@@ -97,7 +95,7 @@ macro_rules! generate_connections {
 
         impl Drop for DbConn {
             fn drop(&mut self) {
-                let conn = self.conn.clone();
+                let conn = Arc::clone(&self.conn);
                 let permit = self.permit.take();
 
                 // Since connection can't be on the stack in an async fn during an
@@ -125,7 +123,6 @@ macro_rules! generate_connections {
 
         impl DbPool {
             // For the given database URL, guess its type, run migrations, create pool, and return it
-            #[allow(clippy::diverging_sub_expression)]
             pub fn from_config() -> Result<Self, Error> {
                 let url = CONFIG.database_url();
                 let conn_type = DbConnType::from_url(&url)?;
@@ -144,21 +141,20 @@ macro_rules! generate_connections {
                                 }))
                                 .build(manager)
                                 .map_res("Failed to create pool")?;
-                            return Ok(DbPool {
+                            Ok(DbPool {
                                 pool: Some(DbPoolInner::$name(pool)),
                                 semaphore: Arc::new(Semaphore::new(CONFIG.database_max_conns() as usize)),
-                            });
+                            })
                         }
                         #[cfg(not($name))]
-                        #[allow(unreachable_code)]
-                        return unreachable!("Trying to use a DB backend when it's feature is disabled");
+                        unreachable!("Trying to use a DB backend when it's feature is disabled")
                     },
                 )+ }
             }
             // Get a connection from the pool
             pub async fn get(&self) -> Result<DbConn, Error> {
                 let duration = Duration::from_secs(CONFIG.database_timeout());
-                let permit = match timeout(duration, self.semaphore.clone().acquire_owned()).await {
+                let permit = match timeout(duration, Arc::clone(&self.semaphore).acquire_owned()).await {
                     Ok(p) => p.expect("Semaphore should be open"),
                     Err(_) => {
                         err!("Timeout waiting for database connection");
@@ -171,10 +167,10 @@ macro_rules! generate_connections {
                         let pool = p.clone();
                         let c = run_blocking(move || pool.get_timeout(duration)).await.map_res("Error retrieving connection from pool")?;
 
-                        return Ok(DbConn {
+                        Ok(DbConn {
                             conn: Arc::new(Mutex::new(Some(DbConnInner::$name(c)))),
                             permit: Some(permit)
-                        });
+                        })
                     },
                 )+ }
             }
@@ -182,10 +178,18 @@ macro_rules! generate_connections {
     };
 }
 
+#[cfg(not(query_logger))]
 generate_connections! {
     sqlite: diesel::sqlite::SqliteConnection,
     mysql: diesel::mysql::MysqlConnection,
     postgresql: diesel::pg::PgConnection
+}
+
+#[cfg(query_logger)]
+generate_connections! {
+    sqlite: diesel_logger::LoggingConnection<diesel::sqlite::SqliteConnection>,
+    mysql: diesel_logger::LoggingConnection<diesel::mysql::MysqlConnection>,
+    postgresql: diesel_logger::LoggingConnection<diesel::pg::PgConnection>
 }
 
 impl DbConnType {
@@ -228,8 +232,8 @@ impl DbConnType {
     pub fn default_init_stmts(&self) -> String {
         match self {
             Self::sqlite => "PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;".to_string(),
-            Self::mysql => "".to_string(),
-            Self::postgresql => "".to_string(),
+            Self::mysql => String::new(),
+            Self::postgresql => String::new(),
         }
     }
 }
@@ -365,7 +369,7 @@ pub mod models;
 
 /// Creates a back-up of the sqlite database
 /// MySQL/MariaDB and PostgreSQL are not supported.
-pub async fn backup_database(conn: &DbConn) -> Result<(), Error> {
+pub async fn backup_database(conn: &mut DbConn) -> Result<(), Error> {
     db_run! {@raw conn:
         postgresql, mysql {
             let _ = conn;
@@ -376,22 +380,26 @@ pub async fn backup_database(conn: &DbConn) -> Result<(), Error> {
             let db_url = CONFIG.database_url();
             let db_path = Path::new(&db_url).parent().unwrap().to_string_lossy();
             let file_date = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
-            diesel::sql_query(format!("VACUUM INTO '{}/db_{}.sqlite3'", db_path, file_date)).execute(conn)?;
+            diesel::sql_query(format!("VACUUM INTO '{db_path}/db_{file_date}.sqlite3'")).execute(conn)?;
             Ok(())
         }
     }
 }
 
 /// Get the SQL Server version
-pub async fn get_sql_server_version(conn: &DbConn) -> String {
+pub async fn get_sql_server_version(conn: &mut DbConn) -> String {
     db_run! {@raw conn:
         postgresql, mysql {
-            no_arg_sql_function!(version, diesel::sql_types::Text);
-            diesel::select(version).get_result::<String>(conn).unwrap_or_else(|_| "Unknown".to_string())
+            sql_function!{
+                fn version() -> diesel::sql_types::Text;
+            }
+            diesel::select(version()).get_result::<String>(conn).unwrap_or_else(|_| "Unknown".to_string())
         }
         sqlite {
-            no_arg_sql_function!(sqlite_version, diesel::sql_types::Text);
-            diesel::select(sqlite_version).get_result::<String>(conn).unwrap_or_else(|_| "Unknown".to_string())
+            sql_function!{
+                fn sqlite_version() -> diesel::sql_types::Text;
+            }
+            diesel::select(sqlite_version()).get_result::<String>(conn).unwrap_or_else(|_| "Unknown".to_string())
         }
     }
 }
@@ -416,68 +424,64 @@ impl<'r> FromRequest<'r> for DbConn {
 // https://docs.rs/diesel_migrations/*/diesel_migrations/macro.embed_migrations.html
 #[cfg(sqlite)]
 mod sqlite_migrations {
-    embed_migrations!("migrations/sqlite");
+    use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
+    pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/sqlite");
 
     pub fn run_migrations() -> Result<(), super::Error> {
-        // Make sure the directory exists
-        let url = crate::CONFIG.database_url();
-        let path = std::path::Path::new(&url);
-
-        if let Some(parent) = path.parent() {
-            if std::fs::create_dir_all(parent).is_err() {
-                error!("Error creating database directory");
-                std::process::exit(1);
-            }
-        }
-
         use diesel::{Connection, RunQueryDsl};
-        // Make sure the database is up to date (create if it doesn't exist, or run the migrations)
-        let connection = diesel::sqlite::SqliteConnection::establish(&crate::CONFIG.database_url())?;
-        // Disable Foreign Key Checks during migration
+        let url = crate::CONFIG.database_url();
 
+        // Establish a connection to the sqlite database (this will create a new one, if it does
+        // not exist, and exit if there is an error).
+        let mut connection = diesel::sqlite::SqliteConnection::establish(&url)?;
+
+        // Run the migrations after successfully establishing a connection
+        // Disable Foreign Key Checks during migration
         // Scoped to a connection.
         diesel::sql_query("PRAGMA foreign_keys = OFF")
-            .execute(&connection)
+            .execute(&mut connection)
             .expect("Failed to disable Foreign Key Checks during migrations");
 
         // Turn on WAL in SQLite
         if crate::CONFIG.enable_db_wal() {
-            diesel::sql_query("PRAGMA journal_mode=wal").execute(&connection).expect("Failed to turn on WAL");
+            diesel::sql_query("PRAGMA journal_mode=wal").execute(&mut connection).expect("Failed to turn on WAL");
         }
 
-        embedded_migrations::run_with_output(&connection, &mut std::io::stdout())?;
+        connection.run_pending_migrations(MIGRATIONS).expect("Error running migrations");
         Ok(())
     }
 }
 
 #[cfg(mysql)]
 mod mysql_migrations {
-    embed_migrations!("migrations/mysql");
+    use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
+    pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/mysql");
 
     pub fn run_migrations() -> Result<(), super::Error> {
         use diesel::{Connection, RunQueryDsl};
         // Make sure the database is up to date (create if it doesn't exist, or run the migrations)
-        let connection = diesel::mysql::MysqlConnection::establish(&crate::CONFIG.database_url())?;
+        let mut connection = diesel::mysql::MysqlConnection::establish(&crate::CONFIG.database_url())?;
         // Disable Foreign Key Checks during migration
 
         // Scoped to a connection/session.
         diesel::sql_query("SET FOREIGN_KEY_CHECKS = 0")
-            .execute(&connection)
+            .execute(&mut connection)
             .expect("Failed to disable Foreign Key Checks during migrations");
 
-        embedded_migrations::run_with_output(&connection, &mut std::io::stdout())?;
+        connection.run_pending_migrations(MIGRATIONS).expect("Error running migrations");
         Ok(())
     }
 }
 
 #[cfg(postgresql)]
 mod postgresql_migrations {
-    embed_migrations!("migrations/postgresql");
+    use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
+    pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/postgresql");
 
     pub fn run_migrations() -> Result<(), super::Error> {
         use diesel::{Connection, RunQueryDsl};
         // Make sure the database is up to date (create if it doesn't exist, or run the migrations)
-        let connection = diesel::pg::PgConnection::establish(&crate::CONFIG.database_url())?;
+        let mut connection = diesel::pg::PgConnection::establish(&crate::CONFIG.database_url())?;
         // Disable Foreign Key Checks during migration
 
         // FIXME: Per https://www.postgresql.org/docs/12/sql-set-constraints.html,
@@ -487,10 +491,10 @@ mod postgresql_migrations {
         // Migrations that need to disable foreign key checks should run this
         // from within the migration script itself.
         diesel::sql_query("SET CONSTRAINTS ALL DEFERRED")
-            .execute(&connection)
+            .execute(&mut connection)
             .expect("Failed to disable Foreign Key Checks during migrations");
 
-        embedded_migrations::run_with_output(&connection, &mut std::io::stdout())?;
+        connection.run_pending_migrations(MIGRATIONS).expect("Error running migrations");
         Ok(())
     }
 }

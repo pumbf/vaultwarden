@@ -1,7 +1,7 @@
 //
 // Web Headers and caching
 //
-use std::io::Cursor;
+use std::io::{Cursor, ErrorKind};
 
 use rocket::{
     fairing::{Fairing, Info, Kind},
@@ -29,21 +29,65 @@ impl Fairing for AppHeaders {
         }
     }
 
-    async fn on_response<'r>(&self, _req: &'r Request<'_>, res: &mut Response<'r>) {
-        res.set_raw_header("Permissions-Policy", "accelerometer=(), ambient-light-sensor=(), autoplay=(), camera=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), sync-xhr=(self \"https://haveibeenpwned.com\" \"https://2fa.directory\"), usb=(), vr=()");
+    async fn on_response<'r>(&self, req: &'r Request<'_>, res: &mut Response<'r>) {
+        res.set_raw_header("Permissions-Policy", "accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=()");
         res.set_raw_header("Referrer-Policy", "same-origin");
-        res.set_raw_header("X-Frame-Options", "SAMEORIGIN");
         res.set_raw_header("X-Content-Type-Options", "nosniff");
         // Obsolete in modern browsers, unsafe (XS-Leak), and largely replaced by CSP
         res.set_raw_header("X-XSS-Protection", "0");
-        let csp = format!(
+
+        let req_uri_path = req.uri().path();
+
+        // Do not send the Content-Security-Policy (CSP) Header and X-Frame-Options for the *-connector.html files.
+        // This can cause issues when some MFA requests needs to open a popup or page within the clients like WebAuthn, or Duo.
+        // This is the same behaviour as upstream Bitwarden.
+        if !req_uri_path.ends_with("connector.html") {
+            // # Frame Ancestors:
             // Chrome Web Store: https://chrome.google.com/webstore/detail/bitwarden-free-password-m/nngceckbapebfimnlniiiahkandclblb
             // Edge Add-ons: https://microsoftedge.microsoft.com/addons/detail/bitwarden-free-password/jbkfoedolllekgbhcbcoahefnbanhhlh?hl=en-US
             // Firefox Browser Add-ons: https://addons.mozilla.org/en-US/firefox/addon/bitwarden-password-manager/
-            "frame-ancestors 'self' chrome-extension://nngceckbapebfimnlniiiahkandclblb chrome-extension://jbkfoedolllekgbhcbcoahefnbanhhlh moz-extension://* {};",
-            CONFIG.allowed_iframe_ancestors()
-        );
-        res.set_raw_header("Content-Security-Policy", csp);
+            // # img/child/frame src:
+            // Have I Been Pwned and Gravator to allow those calls to work.
+            // # Connect src:
+            // Leaked Passwords check: api.pwnedpasswords.com
+            // 2FA/MFA Site check: api.2fa.directory
+            // # Mail Relay: https://bitwarden.com/blog/add-privacy-and-security-using-email-aliases-with-bitwarden/
+            // app.simplelogin.io, app.anonaddy.com, api.fastmail.com, quack.duckduckgo.com
+            let csp = format!(
+                "default-src 'self'; \
+                base-uri 'self'; \
+                form-action 'self'; \
+                object-src 'self' blob:; \
+                script-src 'self'; \
+                style-src 'self' 'unsafe-inline'; \
+                child-src 'self' https://*.duosecurity.com https://*.duofederal.com; \
+                frame-src 'self' https://*.duosecurity.com https://*.duofederal.com; \
+                frame-ancestors 'self' \
+                  chrome-extension://nngceckbapebfimnlniiiahkandclblb \
+                  chrome-extension://jbkfoedolllekgbhcbcoahefnbanhhlh \
+                  moz-extension://* \
+                  {allowed_iframe_ancestors}; \
+                img-src 'self' data: \
+                  https://haveibeenpwned.com \
+                  https://www.gravatar.com \
+                  {icon_service_csp}; \
+                connect-src 'self' \
+                  https://api.pwnedpasswords.com \
+                  https://api.2fa.directory \
+                  https://app.simplelogin.io/api/ \
+                  https://app.anonaddy.com/api/ \
+                  https://api.fastmail.com/ \
+                  ;\
+                ",
+                icon_service_csp = CONFIG._icon_service_csp(),
+                allowed_iframe_ancestors = CONFIG.allowed_iframe_ancestors()
+            );
+            res.set_raw_header("Content-Security-Policy", csp);
+            res.set_raw_header("X-Frame-Options", "SAMEORIGIN");
+        } else {
+            // It looks like this header get's set somewhere else also, make sure this is not sent for these files, it will cause MFA issues.
+            res.remove_header("X-Frame-Options");
+        }
 
         // Disable cache unless otherwise specified
         if !res.headers().contains("cache-control") {
@@ -58,7 +102,7 @@ impl Cors {
     fn get_header(headers: &HeaderMap<'_>, name: &str) -> String {
         match headers.get_one(name) {
             Some(h) => h.to_string(),
-            _ => "".to_string(),
+            _ => String::new(),
         }
     }
 
@@ -265,7 +309,7 @@ impl Fairing for BetterLogging {
 //
 use std::{
     fs::{self, File},
-    io::{Read, Result as IOResult},
+    io::Result as IOResult,
     path::Path,
 };
 
@@ -273,30 +317,21 @@ pub fn file_exists(path: &str) -> bool {
     Path::new(path).exists()
 }
 
-pub fn read_file(path: &str) -> IOResult<Vec<u8>> {
-    let mut contents: Vec<u8> = Vec::new();
-
-    let mut file = File::open(Path::new(path))?;
-    file.read_to_end(&mut contents)?;
-
-    Ok(contents)
-}
-
 pub fn write_file(path: &str, content: &[u8]) -> Result<(), crate::error::Error> {
     use std::io::Write;
-    let mut f = File::create(path)?;
+    let mut f = match File::create(path) {
+        Ok(file) => file,
+        Err(e) => {
+            if e.kind() == ErrorKind::PermissionDenied {
+                error!("Can't create '{}': Permission denied", path);
+            }
+            return Err(From::from(e));
+        }
+    };
+
     f.write_all(content)?;
     f.flush()?;
     Ok(())
-}
-
-pub fn read_file_string(path: &str) -> IOResult<String> {
-    let mut contents = String::new();
-
-    let mut file = File::open(Path::new(path))?;
-    file.read_to_string(&mut contents)?;
-
-    Ok(contents)
 }
 
 pub fn delete_file(path: &str) -> IOResult<()> {
@@ -339,11 +374,21 @@ pub fn get_uuid() -> String {
 
 use std::str::FromStr;
 
+#[inline]
 pub fn upcase_first(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
         None => String::new(),
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+    }
+}
+
+#[inline]
+pub fn lcase_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
     }
 }
 
@@ -366,16 +411,16 @@ where
 use std::env;
 
 pub fn get_env_str_value(key: &str) -> Option<String> {
-    let key_file = format!("{}_FILE", key);
+    let key_file = format!("{key}_FILE");
     let value_from_env = env::var(key);
     let value_file = env::var(&key_file);
 
     match (value_from_env, value_file) {
-        (Ok(_), Ok(_)) => panic!("You should not define both {} and {}!", key, key_file),
+        (Ok(_), Ok(_)) => panic!("You should not define both {key} and {key_file}!"),
         (Ok(v_env), Err(_)) => Some(v_env),
         (Err(_), Ok(v_file)) => match fs::read_to_string(v_file) {
             Ok(content) => Some(content.trim().to_string()),
-            Err(e) => panic!("Failed to load {}: {:?}", key, e),
+            Err(e) => panic!("Failed to load {key}: {e:?}"),
         },
         _ => None,
     }
@@ -405,10 +450,13 @@ pub fn get_env_bool(key: &str) -> Option<bool> {
 
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 
+// Format used by Bitwarden API
+const DATETIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6fZ";
+
 /// Formats a UTC-offset `NaiveDateTime` in the format used by Bitwarden API
 /// responses with "date" fields (`CreationDate`, `RevisionDate`, etc.).
 pub fn format_date(dt: &NaiveDateTime) -> String {
-    dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+    dt.format(DATETIME_FORMAT).to_string()
 }
 
 /// Formats a `DateTime<Local>` using the specified format string.
@@ -449,6 +497,10 @@ pub fn format_datetime_http(dt: &DateTime<Local>) -> String {
     expiry_time.to_rfc2822().replace("+0000", "GMT")
 }
 
+pub fn parse_date(date: &str) -> NaiveDateTime {
+    NaiveDateTime::parse_from_str(date, DATETIME_FORMAT).unwrap()
+}
+
 //
 // Deployment environment methods
 //
@@ -460,13 +512,13 @@ pub fn is_running_in_docker() -> bool {
 
 /// Simple check to determine on which docker base image vaultwarden is running.
 /// We build images based upon Debian or Alpine, so these we check here.
-pub fn docker_base_image() -> String {
+pub fn docker_base_image() -> &'static str {
     if Path::new("/etc/debian_version").exists() {
-        "Debian".to_string()
+        "Debian"
     } else if Path::new("/etc/alpine-release").exists() {
-        "Alpine".to_string()
+        "Alpine"
     } else {
-        "Unknown".to_string()
+        "Unknown"
     }
 }
 
@@ -569,9 +621,9 @@ fn _process_key(key: &str) -> String {
 // Retry methods
 //
 
-pub fn retry<F, T, E>(func: F, max_tries: u32) -> Result<T, E>
+pub fn retry<F, T, E>(mut func: F, max_tries: u32) -> Result<T, E>
 where
-    F: Fn() -> Result<T, E>,
+    F: FnMut() -> Result<T, E>,
 {
     let mut tries = 0;
 
@@ -590,9 +642,9 @@ where
     }
 }
 
-pub async fn retry_db<F, T, E>(func: F, max_tries: u32) -> Result<T, E>
+pub async fn retry_db<F, T, E>(mut func: F, max_tries: u32) -> Result<T, E>
 where
-    F: Fn() -> Result<T, E>,
+    F: FnMut() -> Result<T, E>,
     E: std::error::Error,
 {
     let mut tries = 0;
@@ -631,4 +683,47 @@ pub fn get_reqwest_client_builder() -> ClientBuilder {
     let mut headers = header::HeaderMap::new();
     headers.insert(header::USER_AGENT, header::HeaderValue::from_static("Vaultwarden"));
     Client::builder().default_headers(headers).timeout(Duration::from_secs(10))
+}
+
+pub fn convert_json_key_lcase_first(src_json: Value) -> Value {
+    match src_json {
+        Value::Array(elm) => {
+            let mut new_array: Vec<Value> = Vec::with_capacity(elm.len());
+
+            for obj in elm {
+                new_array.push(convert_json_key_lcase_first(obj));
+            }
+            Value::Array(new_array)
+        }
+
+        Value::Object(obj) => {
+            let mut json_map = JsonMap::new();
+            for (key, value) in obj.iter() {
+                match (key, value) {
+                    (key, Value::Object(elm)) => {
+                        let inner_value = convert_json_key_lcase_first(Value::Object(elm.clone()));
+                        json_map.insert(lcase_first(key), inner_value);
+                    }
+
+                    (key, Value::Array(elm)) => {
+                        let mut inner_array: Vec<Value> = Vec::with_capacity(elm.len());
+
+                        for inner_obj in elm {
+                            inner_array.push(convert_json_key_lcase_first(inner_obj.clone()));
+                        }
+
+                        json_map.insert(lcase_first(key), Value::Array(inner_array));
+                    }
+
+                    (key, value) => {
+                        json_map.insert(lcase_first(key), value.clone());
+                    }
+                }
+            }
+
+            Value::Object(json_map)
+        }
+
+        value => value,
+    }
 }
