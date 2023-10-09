@@ -1,17 +1,15 @@
 use std::{
-    net::SocketAddr,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
     time::Duration,
 };
 
-use chrono::NaiveDateTime;
-use futures::{SinkExt, StreamExt};
+use chrono::{NaiveDateTime, Utc};
 use rmpv::Value;
-use rocket::{serde::json::Json, Route};
-use serde_json::Value as JsonValue;
+use rocket::{
+    futures::{SinkExt, StreamExt},
+    Route,
+};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::mpsc::Sender,
@@ -22,56 +20,236 @@ use tokio_tungstenite::{
 };
 
 use crate::{
-    api::EmptyResult,
-    auth::Headers,
-    db::models::{Cipher, Folder, Send, User},
+    auth::{ClientIp, WsAccessTokenHeader},
+    db::{
+        models::{Cipher, Folder, Send as DbSend, User},
+        DbConn,
+    },
     Error, CONFIG,
 };
 
+use once_cell::sync::Lazy;
+
+static WS_USERS: Lazy<Arc<WebSocketUsers>> = Lazy::new(|| {
+    Arc::new(WebSocketUsers {
+        map: Arc::new(dashmap::DashMap::new()),
+    })
+});
+
+pub static WS_ANONYMOUS_SUBSCRIPTIONS: Lazy<Arc<AnonymousWebSocketSubscriptions>> = Lazy::new(|| {
+    Arc::new(AnonymousWebSocketSubscriptions {
+        map: Arc::new(dashmap::DashMap::new()),
+    })
+});
+
+use super::{
+    push::push_auth_request, push::push_auth_response, push_cipher_update, push_folder_update, push_logout,
+    push_send_update, push_user_update,
+};
+
 pub fn routes() -> Vec<Route> {
-    routes![negotiate, websockets_err]
+    routes![websockets_hub, anonymous_websockets_hub]
 }
 
-#[get("/hub")]
-fn websockets_err() -> EmptyResult {
-    static SHOW_WEBSOCKETS_MSG: AtomicBool = AtomicBool::new(true);
+#[derive(FromForm, Debug)]
+struct WsAccessToken {
+    access_token: Option<String>,
+}
 
-    if CONFIG.websocket_enabled()
-        && SHOW_WEBSOCKETS_MSG.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed).is_ok()
-    {
-        err!(
-            "
-    ###########################################################
-    '/notifications/hub' should be proxied to the websocket server or notifications won't work.
-    Go to the Wiki for more info, or disable WebSockets setting WEBSOCKET_ENABLED=false.
-    ###########################################################################################\n"
-        )
+struct WSEntryMapGuard {
+    users: Arc<WebSocketUsers>,
+    user_uuid: String,
+    entry_uuid: uuid::Uuid,
+    addr: IpAddr,
+}
+
+impl WSEntryMapGuard {
+    fn new(users: Arc<WebSocketUsers>, user_uuid: String, entry_uuid: uuid::Uuid, addr: IpAddr) -> Self {
+        Self {
+            users,
+            user_uuid,
+            entry_uuid,
+            addr,
+        }
+    }
+}
+
+impl Drop for WSEntryMapGuard {
+    fn drop(&mut self) {
+        info!("Closing WS connection from {}", self.addr);
+        if let Some(mut entry) = self.users.map.get_mut(&self.user_uuid) {
+            entry.retain(|(uuid, _)| uuid != &self.entry_uuid);
+        }
+    }
+}
+
+struct WSAnonymousEntryMapGuard {
+    subscriptions: Arc<AnonymousWebSocketSubscriptions>,
+    token: String,
+    addr: IpAddr,
+}
+
+impl WSAnonymousEntryMapGuard {
+    fn new(subscriptions: Arc<AnonymousWebSocketSubscriptions>, token: String, addr: IpAddr) -> Self {
+        Self {
+            subscriptions,
+            token,
+            addr,
+        }
+    }
+}
+
+impl Drop for WSAnonymousEntryMapGuard {
+    fn drop(&mut self) {
+        info!("Closing WS connection from {}", self.addr);
+        self.subscriptions.map.remove(&self.token);
+    }
+}
+
+#[get("/hub?<data..>")]
+fn websockets_hub<'r>(
+    ws: rocket_ws::WebSocket,
+    data: WsAccessToken,
+    ip: ClientIp,
+    header_token: WsAccessTokenHeader,
+) -> Result<rocket_ws::Stream!['r], Error> {
+    let addr = ip.ip;
+    info!("Accepting Rocket WS connection from {addr}");
+
+    let token = if let Some(token) = data.access_token {
+        token
+    } else if let Some(token) = header_token.access_token {
+        token
     } else {
-        Err(Error::empty())
-    }
+        err_code!("Invalid claim", 401)
+    };
+
+    let Ok(claims) = crate::auth::decode_login(&token) else {
+        err_code!("Invalid token", 401)
+    };
+
+    let (mut rx, guard) = {
+        let users = Arc::clone(&WS_USERS);
+
+        // Add a channel to send messages to this client to the map
+        let entry_uuid = uuid::Uuid::new_v4();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
+        users.map.entry(claims.sub.clone()).or_default().push((entry_uuid, tx));
+
+        // Once the guard goes out of scope, the connection will have been closed and the entry will be deleted from the map
+        (rx, WSEntryMapGuard::new(users, claims.sub, entry_uuid, addr))
+    };
+
+    Ok({
+        rocket_ws::Stream! { ws => {
+            let mut ws = ws;
+            let _guard = guard;
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                tokio::select! {
+                    res = ws.next() =>  {
+                        match res {
+                            Some(Ok(message)) => {
+                                match message {
+                                    // Respond to any pings
+                                    Message::Ping(ping) => yield Message::Pong(ping),
+                                    Message::Pong(_) => {/* Ignored */},
+
+                                    // We should receive an initial message with the protocol and version, and we will reply to it
+                                    Message::Text(ref message) => {
+                                        let msg = message.strip_suffix(RECORD_SEPARATOR as char).unwrap_or(message);
+
+                                        if serde_json::from_str(msg).ok() == Some(INITIAL_MESSAGE) {
+                                            yield Message::binary(INITIAL_RESPONSE);
+                                            continue;
+                                        }
+                                    }
+                                    // Just echo anything else the client sends
+                                    _ => yield message,
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+
+                    res = rx.recv() => {
+                        match res {
+                            Some(res) => yield res,
+                            None => break,
+                        }
+                    }
+
+                    _ = interval.tick() => yield Message::Ping(create_ping())
+                }
+            }
+        }}
+    })
 }
 
-#[post("/hub/negotiate")]
-fn negotiate(_headers: Headers) -> Json<JsonValue> {
-    use crate::crypto;
-    use data_encoding::BASE64URL;
+#[get("/anonymous-hub?<token..>")]
+fn anonymous_websockets_hub<'r>(
+    ws: rocket_ws::WebSocket,
+    token: String,
+    ip: ClientIp,
+) -> Result<rocket_ws::Stream!['r], Error> {
+    let addr = ip.ip;
+    info!("Accepting Anonymous Rocket WS connection from {addr}");
 
-    let conn_id = BASE64URL.encode(&crypto::get_random(vec![0u8; 16]));
-    let mut available_transports: Vec<JsonValue> = Vec::new();
+    let (mut rx, guard) = {
+        let subscriptions = Arc::clone(&WS_ANONYMOUS_SUBSCRIPTIONS);
 
-    if CONFIG.websocket_enabled() {
-        available_transports.push(json!({"transport":"WebSockets", "transferFormats":["Text","Binary"]}));
-    }
+        // Add a channel to send messages to this client to the map
+        let (tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
+        subscriptions.map.insert(token.clone(), tx);
 
-    // TODO: Implement transports
-    // Rocket WS support: https://github.com/SergioBenitez/Rocket/issues/90
-    // Rocket SSE support: https://github.com/SergioBenitez/Rocket/issues/33
-    // {"transport":"ServerSentEvents", "transferFormats":["Text"]},
-    // {"transport":"LongPolling", "transferFormats":["Text","Binary"]}
-    Json(json!({
-        "connectionId": conn_id,
-        "availableTransports": available_transports
-    }))
+        // Once the guard goes out of scope, the connection will have been closed and the entry will be deleted from the map
+        (rx, WSAnonymousEntryMapGuard::new(subscriptions, token, addr))
+    };
+
+    Ok({
+        rocket_ws::Stream! { ws => {
+            let mut ws = ws;
+            let _guard = guard;
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                tokio::select! {
+                    res = ws.next() =>  {
+                        match res {
+                            Some(Ok(message)) => {
+                                match message {
+                                    // Respond to any pings
+                                    Message::Ping(ping) => yield Message::Pong(ping),
+                                    Message::Pong(_) => {/* Ignored */},
+
+                                    // We should receive an initial message with the protocol and version, and we will reply to it
+                                    Message::Text(ref message) => {
+                                        let msg = message.strip_suffix(RECORD_SEPARATOR as char).unwrap_or(message);
+
+                                        if serde_json::from_str(msg).ok() == Some(INITIAL_MESSAGE) {
+                                            yield Message::binary(INITIAL_RESPONSE);
+                                            continue;
+                                        }
+                                    }
+                                    // Just echo anything else the client sends
+                                    _ => yield message,
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+
+                    res = rx.recv() => {
+                        match res {
+                            Some(res) => yield res,
+                            None => break,
+                        }
+                    }
+
+                    _ = interval.tick() => yield Message::Ping(create_ping())
+                }
+            }
+        }}
+    })
 }
 
 //
@@ -152,8 +330,8 @@ impl WebSocketUsers {
     async fn send_update(&self, user_uuid: &str, data: &[u8]) {
         if let Some(user) = self.map.get(user_uuid).map(|v| v.clone()) {
             for (_, sender) in user.iter() {
-                if sender.send(Message::binary(data)).await.is_err() {
-                    // TODO: Delete from map here too?
+                if let Err(e) = sender.send(Message::binary(data)).await {
+                    error!("Error sending WS update {e}");
                 }
             }
         }
@@ -164,12 +342,37 @@ impl WebSocketUsers {
         let data = create_update(
             vec![("UserId".into(), user.uuid.clone().into()), ("Date".into(), serialize_date(user.updated_at))],
             ut,
+            None,
         );
 
         self.send_update(&user.uuid, &data).await;
+
+        if CONFIG.push_enabled() {
+            push_user_update(ut, user);
+        }
     }
 
-    pub async fn send_folder_update(&self, ut: UpdateType, folder: &Folder) {
+    pub async fn send_logout(&self, user: &User, acting_device_uuid: Option<String>) {
+        let data = create_update(
+            vec![("UserId".into(), user.uuid.clone().into()), ("Date".into(), serialize_date(user.updated_at))],
+            UpdateType::LogOut,
+            acting_device_uuid.clone(),
+        );
+
+        self.send_update(&user.uuid, &data).await;
+
+        if CONFIG.push_enabled() {
+            push_logout(user, acting_device_uuid);
+        }
+    }
+
+    pub async fn send_folder_update(
+        &self,
+        ut: UpdateType,
+        folder: &Folder,
+        acting_device_uuid: &String,
+        conn: &mut DbConn,
+    ) {
         let data = create_update(
             vec![
                 ("Id".into(), folder.uuid.clone().into()),
@@ -177,32 +380,67 @@ impl WebSocketUsers {
                 ("RevisionDate".into(), serialize_date(folder.updated_at)),
             ],
             ut,
+            Some(acting_device_uuid.into()),
         );
 
         self.send_update(&folder.user_uuid, &data).await;
+
+        if CONFIG.push_enabled() {
+            push_folder_update(ut, folder, acting_device_uuid, conn).await;
+        }
     }
 
-    pub async fn send_cipher_update(&self, ut: UpdateType, cipher: &Cipher, user_uuids: &[String]) {
-        let user_uuid = convert_option(cipher.user_uuid.clone());
+    pub async fn send_cipher_update(
+        &self,
+        ut: UpdateType,
+        cipher: &Cipher,
+        user_uuids: &[String],
+        acting_device_uuid: &String,
+        collection_uuids: Option<Vec<String>>,
+        conn: &mut DbConn,
+    ) {
         let org_uuid = convert_option(cipher.organization_uuid.clone());
+        // Depending if there are collections provided or not, we need to have different values for the following variables.
+        // The user_uuid should be `null`, and the revision date should be set to now, else the clients won't sync the collection change.
+        let (user_uuid, collection_uuids, revision_date) = if let Some(collection_uuids) = collection_uuids {
+            (
+                Value::Nil,
+                Value::Array(collection_uuids.into_iter().map(|v| v.into()).collect::<Vec<rmpv::Value>>()),
+                serialize_date(Utc::now().naive_utc()),
+            )
+        } else {
+            (convert_option(cipher.user_uuid.clone()), Value::Nil, serialize_date(cipher.updated_at))
+        };
 
         let data = create_update(
             vec![
                 ("Id".into(), cipher.uuid.clone().into()),
                 ("UserId".into(), user_uuid),
                 ("OrganizationId".into(), org_uuid),
-                ("CollectionIds".into(), Value::Nil),
-                ("RevisionDate".into(), serialize_date(cipher.updated_at)),
+                ("CollectionIds".into(), collection_uuids),
+                ("RevisionDate".into(), revision_date),
             ],
             ut,
+            Some(acting_device_uuid.into()),
         );
 
         for uuid in user_uuids {
             self.send_update(uuid, &data).await;
         }
+
+        if CONFIG.push_enabled() && user_uuids.len() == 1 {
+            push_cipher_update(ut, cipher, acting_device_uuid, conn).await;
+        }
     }
 
-    pub async fn send_send_update(&self, ut: UpdateType, send: &Send, user_uuids: &[String]) {
+    pub async fn send_send_update(
+        &self,
+        ut: UpdateType,
+        send: &DbSend,
+        user_uuids: &[String],
+        acting_device_uuid: &String,
+        conn: &mut DbConn,
+    ) {
         let user_uuid = convert_option(send.user_uuid.clone());
 
         let data = create_update(
@@ -212,11 +450,78 @@ impl WebSocketUsers {
                 ("RevisionDate".into(), serialize_date(send.revision_date)),
             ],
             ut,
+            None,
         );
 
         for uuid in user_uuids {
             self.send_update(uuid, &data).await;
         }
+        if CONFIG.push_enabled() && user_uuids.len() == 1 {
+            push_send_update(ut, send, acting_device_uuid, conn).await;
+        }
+    }
+
+    pub async fn send_auth_request(
+        &self,
+        user_uuid: &String,
+        auth_request_uuid: &String,
+        acting_device_uuid: &String,
+        conn: &mut DbConn,
+    ) {
+        let data = create_update(
+            vec![("Id".into(), auth_request_uuid.clone().into()), ("UserId".into(), user_uuid.clone().into())],
+            UpdateType::AuthRequest,
+            Some(acting_device_uuid.to_string()),
+        );
+        self.send_update(user_uuid, &data).await;
+
+        if CONFIG.push_enabled() {
+            push_auth_request(user_uuid.to_string(), auth_request_uuid.to_string(), conn).await;
+        }
+    }
+
+    pub async fn send_auth_response(
+        &self,
+        user_uuid: &String,
+        auth_response_uuid: &str,
+        approving_device_uuid: String,
+        conn: &mut DbConn,
+    ) {
+        let data = create_update(
+            vec![("Id".into(), auth_response_uuid.to_owned().into()), ("UserId".into(), user_uuid.clone().into())],
+            UpdateType::AuthRequestResponse,
+            approving_device_uuid.clone().into(),
+        );
+        self.send_update(auth_response_uuid, &data).await;
+
+        if CONFIG.push_enabled() {
+            push_auth_response(user_uuid.to_string(), auth_response_uuid.to_string(), approving_device_uuid, conn)
+                .await;
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AnonymousWebSocketSubscriptions {
+    map: Arc<dashmap::DashMap<String, Sender<Message>>>,
+}
+
+impl AnonymousWebSocketSubscriptions {
+    async fn send_update(&self, token: &str, data: &[u8]) {
+        if let Some(sender) = self.map.get(token).map(|v| v.clone()) {
+            if let Err(e) = sender.send(Message::binary(data)).await {
+                error!("Error sending WS update {e}");
+            }
+        }
+    }
+
+    pub async fn send_auth_response(&self, user_uuid: &String, auth_response_uuid: &str) {
+        let data = create_anonymous_update(
+            vec![("Id".into(), auth_response_uuid.to_owned().into()), ("UserId".into(), user_uuid.clone().into())],
+            UpdateType::AuthRequestResponse,
+            user_uuid.to_string(),
+        );
+        self.send_update(auth_response_uuid, &data).await;
     }
 }
 
@@ -228,14 +533,14 @@ impl WebSocketUsers {
     "ReceiveMessage", // Target
     [ // Arguments
         {
-            "ContextId": "app_id",
+            "ContextId": acting_device_uuid || Nil,
             "Type": ut as i32,
             "Payload": {}
         }
     ]
 ]
 */
-fn create_update(payload: Vec<(Value, Value)>, ut: UpdateType) -> Vec<u8> {
+fn create_update(payload: Vec<(Value, Value)>, ut: UpdateType, acting_device_uuid: Option<String>) -> Vec<u8> {
     use rmpv::Value as V;
 
     let value = V::Array(vec![
@@ -244,9 +549,27 @@ fn create_update(payload: Vec<(Value, Value)>, ut: UpdateType) -> Vec<u8> {
         V::Nil,
         "ReceiveMessage".into(),
         V::Array(vec![V::Map(vec![
-            ("ContextId".into(), "app_id".into()),
+            ("ContextId".into(), acting_device_uuid.map(|v| v.into()).unwrap_or_else(|| V::Nil)),
             ("Type".into(), (ut as i32).into()),
             ("Payload".into(), payload.into()),
+        ])]),
+    ]);
+
+    serialize(value)
+}
+
+fn create_anonymous_update(payload: Vec<(Value, Value)>, ut: UpdateType, user_id: String) -> Vec<u8> {
+    use rmpv::Value as V;
+
+    let value = V::Array(vec![
+        1.into(),
+        V::Map(vec![]),
+        V::Nil,
+        "AuthRequestResponseRecieved".into(),
+        V::Array(vec![V::Map(vec![
+            ("Type".into(), (ut as i32).into()),
+            ("Payload".into(), payload.into()),
+            ("UserId".into(), user_id.into()),
         ])]),
     ]);
 
@@ -258,19 +581,19 @@ fn create_ping() -> Vec<u8> {
 }
 
 #[allow(dead_code)]
-#[derive(Eq, PartialEq)]
+#[derive(Copy, Clone, Eq, PartialEq)]
 pub enum UpdateType {
-    CipherUpdate = 0,
-    CipherCreate = 1,
-    LoginDelete = 2,
-    FolderDelete = 3,
-    Ciphers = 4,
+    SyncCipherUpdate = 0,
+    SyncCipherCreate = 1,
+    SyncLoginDelete = 2,
+    SyncFolderDelete = 3,
+    SyncCiphers = 4,
 
-    Vault = 5,
-    OrgKeys = 6,
-    FolderCreate = 7,
-    FolderUpdate = 8,
-    CipherDelete = 9,
+    SyncVault = 5,
+    SyncOrgKeys = 6,
+    SyncFolderCreate = 7,
+    SyncFolderUpdate = 8,
+    SyncCipherDelete = 9,
     SyncSettings = 10,
 
     LogOut = 11,
@@ -279,18 +602,19 @@ pub enum UpdateType {
     SyncSendUpdate = 13,
     SyncSendDelete = 14,
 
+    AuthRequest = 15,
+    AuthRequestResponse = 16,
+
     None = 100,
 }
 
-pub type Notify<'a> = &'a rocket::State<WebSocketUsers>;
+pub type Notify<'a> = &'a rocket::State<Arc<WebSocketUsers>>;
+pub type AnonymousNotify<'a> = &'a rocket::State<Arc<AnonymousWebSocketSubscriptions>>;
 
-pub fn start_notification_server() -> WebSocketUsers {
-    let users = WebSocketUsers {
-        map: Arc::new(dashmap::DashMap::new()),
-    };
-
+pub fn start_notification_server() -> Arc<WebSocketUsers> {
+    let users = Arc::clone(&WS_USERS);
     if CONFIG.websocket_enabled() {
-        let users2 = users.clone();
+        let users2 = Arc::<WebSocketUsers>::clone(&users);
         tokio::spawn(async move {
             let addr = (CONFIG.websocket_address(), CONFIG.websocket_port());
             info!("Starting WebSockets server on {}:{}", addr.0, addr.1);
@@ -302,7 +626,7 @@ pub fn start_notification_server() -> WebSocketUsers {
             loop {
                 tokio::select! {
                     Ok((stream, addr)) = listener.accept() => {
-                        tokio::spawn(handle_connection(stream, users2.clone(), addr));
+                        tokio::spawn(handle_connection(stream, Arc::<WebSocketUsers>::clone(&users2), addr));
                     }
 
                     _ = &mut shutdown_rx => {
@@ -318,7 +642,7 @@ pub fn start_notification_server() -> WebSocketUsers {
     users
 }
 
-async fn handle_connection(stream: TcpStream, users: WebSocketUsers, addr: SocketAddr) -> Result<(), Error> {
+async fn handle_connection(stream: TcpStream, users: Arc<WebSocketUsers>, addr: SocketAddr) -> Result<(), Error> {
     let mut user_uuid: Option<String> = None;
 
     info!("Accepting WS connection from {addr}");
@@ -338,41 +662,39 @@ async fn handle_connection(stream: TcpStream, users: WebSocketUsers, addr: Socke
 
     let user_uuid = user_uuid.expect("User UUID should be set after the handshake");
 
-    // Add a channel to send messages to this client to the map
-    let entry_uuid = uuid::Uuid::new_v4();
-    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-    users.map.entry(user_uuid.clone()).or_default().push((entry_uuid, tx));
+    let (mut rx, guard) = {
+        // Add a channel to send messages to this client to the map
+        let entry_uuid = uuid::Uuid::new_v4();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
+        users.map.entry(user_uuid.clone()).or_default().push((entry_uuid, tx));
 
+        // Once the guard goes out of scope, the connection will have been closed and the entry will be deleted from the map
+        (rx, WSEntryMapGuard::new(users, user_uuid, entry_uuid, addr.ip()))
+    };
+
+    let _guard = guard;
     let mut interval = tokio::time::interval(Duration::from_secs(15));
     loop {
         tokio::select! {
             res = stream.next() =>  {
                 match res {
                     Some(Ok(message)) => {
-                        // Respond to any pings
-                        if let Message::Ping(ping) = message {
-                            if stream.send(Message::Pong(ping)).await.is_err() {
-                                break;
+                        match message {
+                            // Respond to any pings
+                            Message::Ping(ping) => stream.send(Message::Pong(ping)).await?,
+                            Message::Pong(_) => {/* Ignored */},
+
+                            // We should receive an initial message with the protocol and version, and we will reply to it
+                            Message::Text(ref message) => {
+                                let msg = message.strip_suffix(RECORD_SEPARATOR as char).unwrap_or(message);
+
+                                if serde_json::from_str(msg).ok() == Some(INITIAL_MESSAGE) {
+                                    stream.send(Message::binary(INITIAL_RESPONSE)).await?;
+                                    continue;
+                                }
                             }
-                            continue;
-                        } else if let Message::Pong(_) = message {
-                            /* Ignored */
-                            continue;
-                        }
-
-                        // We should receive an initial message with the protocol and version, and we will reply to it
-                        if let Message::Text(ref message) = message {
-                            let msg = message.strip_suffix(RECORD_SEPARATOR as char).unwrap_or(message);
-
-                            if serde_json::from_str(msg).ok() == Some(INITIAL_MESSAGE) {
-                                stream.send(Message::binary(INITIAL_RESPONSE)).await?;
-                                continue;
-                            }
-                        }
-
-                        // Just echo anything else the client sends
-                        if stream.send(message).await.is_err() {
-                            break;
+                            // Just echo anything else the client sends
+                            _ => stream.send(message).await?,
                         }
                     }
                     _ => break,
@@ -381,27 +703,15 @@ async fn handle_connection(stream: TcpStream, users: WebSocketUsers, addr: Socke
 
             res = rx.recv() => {
                 match res {
-                    Some(res) => {
-                        if stream.send(res).await.is_err() {
-                            break;
-                        }
-                    },
+                    Some(res) => stream.send(res).await?,
                     None => break,
                 }
             }
 
-            _= interval.tick() => {
-                if stream.send(Message::Ping(create_ping())).await.is_err() {
-                    break;
-                }
-            }
+            _ = interval.tick() => stream.send(Message::Ping(create_ping())).await?
         }
     }
 
-    info!("Closing WS connection from {addr}");
-
-    //  Delete from map
-    users.map.entry(user_uuid).or_default().retain(|(uuid, _)| uuid != &entry_uuid);
     Ok(())
 }
 

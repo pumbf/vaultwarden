@@ -2,40 +2,42 @@
 
 # This file was generated using a Jinja2 template.
 # Please make your changes in `Dockerfile.j2` and then `make` the individual Dockerfiles.
-
-{% set build_stage_base_image = "rust:1.61-bullseye" %}
+{% set rust_version = "1.72.0" %}
+{% set debian_version = "bookworm" %}
+{% set alpine_version = "3.17" %}
+{% set build_stage_base_image = "docker.io/library/rust:%s-%s" % (rust_version, debian_version) %}
 {% if "alpine" in target_file %}
 {%   if "amd64" in target_file %}
-{%     set build_stage_base_image = "blackdex/rust-musl:x86_64-musl-stable-1.61.0" %}
-{%     set runtime_stage_base_image = "alpine:3.16" %}
+{%     set build_stage_base_image = "docker.io/blackdex/rust-musl:x86_64-musl-stable-%s-openssl3" % rust_version %}
+{%     set runtime_stage_base_image = "docker.io/library/alpine:%s" % alpine_version %}
 {%     set package_arch_target = "x86_64-unknown-linux-musl" %}
 {%   elif "armv7" in target_file %}
-{%     set build_stage_base_image = "blackdex/rust-musl:armv7-musleabihf-stable-1.61.0" %}
-{%     set runtime_stage_base_image = "balenalib/armv7hf-alpine:3.16" %}
+{%     set build_stage_base_image = "docker.io/blackdex/rust-musl:armv7-musleabihf-stable-%s-openssl3" % rust_version %}
+{%     set runtime_stage_base_image = "docker.io/balenalib/armv7hf-alpine:%s" % alpine_version %}
 {%     set package_arch_target = "armv7-unknown-linux-musleabihf" %}
 {%   elif "armv6" in target_file %}
-{%     set build_stage_base_image = "blackdex/rust-musl:arm-musleabi-stable-1.61.0" %}
-{%     set runtime_stage_base_image = "balenalib/rpi-alpine:3.16" %}
+{%     set build_stage_base_image = "docker.io/blackdex/rust-musl:arm-musleabi-stable-%s-openssl3" % rust_version %}
+{%     set runtime_stage_base_image = "docker.io/balenalib/rpi-alpine:%s" % alpine_version %}
 {%     set package_arch_target = "arm-unknown-linux-musleabi" %}
 {%   elif "arm64" in target_file %}
-{%     set build_stage_base_image = "blackdex/rust-musl:aarch64-musl-stable-1.61.0" %}
-{%     set runtime_stage_base_image = "balenalib/aarch64-alpine:3.16" %}
+{%     set build_stage_base_image = "docker.io/blackdex/rust-musl:aarch64-musl-stable-%s-openssl3" % rust_version %}
+{%     set runtime_stage_base_image = "docker.io/balenalib/aarch64-alpine:%s" % alpine_version %}
 {%     set package_arch_target = "aarch64-unknown-linux-musl" %}
 {%   endif %}
 {% elif "amd64" in target_file %}
-{%   set runtime_stage_base_image = "debian:bullseye-slim" %}
+{%   set runtime_stage_base_image = "docker.io/library/debian:%s-slim" % debian_version %}
 {% elif "arm64" in target_file %}
-{%   set runtime_stage_base_image = "balenalib/aarch64-debian:bullseye" %}
+{%   set runtime_stage_base_image = "docker.io/balenalib/aarch64-debian:%s" % debian_version %}
 {%   set package_arch_name = "arm64" %}
 {%   set package_arch_target = "aarch64-unknown-linux-gnu" %}
 {%   set package_cross_compiler = "aarch64-linux-gnu" %}
 {% elif "armv6" in target_file %}
-{%   set runtime_stage_base_image = "balenalib/rpi-debian:bullseye" %}
+{%   set runtime_stage_base_image = "docker.io/balenalib/rpi-debian:%s" % debian_version %}
 {%   set package_arch_name = "armel" %}
 {%   set package_arch_target = "arm-unknown-linux-gnueabi" %}
 {%   set package_cross_compiler = "arm-linux-gnueabi" %}
 {% elif "armv7" in target_file %}
-{%   set runtime_stage_base_image = "balenalib/armv7hf-debian:bullseye" %}
+{%   set runtime_stage_base_image = "docker.io/balenalib/armv7hf-debian:%s" % debian_version %}
 {%   set package_arch_name = "armhf" %}
 {%   set package_arch_target = "armv7-unknown-linux-gnueabihf" %}
 {%   set package_cross_compiler = "arm-linux-gnueabihf" %}
@@ -50,7 +52,7 @@
 {% else %}
 {%   set package_arch_target_param = "" %}
 {% endif %}
-{% if "buildx" in target_file %}
+{% if "buildkit" in target_file %}
 {%   set mount_rust_cache = "--mount=type=cache,target=/root/.cargo/git --mount=type=cache,target=/root/.cargo/registry " %}
 {% else %}
 {%   set mount_rust_cache = "" %}
@@ -59,8 +61,8 @@
 # 	https://docs.docker.com/develop/develop-images/multistage-build/
 # 	https://whitfin.io/speeding-up-rust-docker-builds/
 ####################### VAULT BUILD IMAGE  #######################
-{% set vault_version = "v2022.9.0" %}
-{% set vault_image_digest = "sha256:99d21235a64084c9115f4aa3da1298881b8bbf146c0d48d6530b4d685a6a6fbc" %}
+{% set vault_version = "v2023.8.2" %}
+{% set vault_image_digest = "sha256:b361e79309ef2c4368f880f350166daade41eb0927a9adf376c76e3713027252" %}
 # The web-vault digest specifies a particular web-vault build on Docker Hub.
 # Using the digest instead of the tag name provides better security,
 # as the digest of an image is immutable, whereas a tag name can later
@@ -70,20 +72,18 @@
 # - From https://hub.docker.com/r/vaultwarden/web-vault/tags,
 #   click the tag name to view the digest of the image it currently points to.
 # - From the command line:
-#     $ docker pull vaultwarden/web-vault:{{ vault_version }}
-#     $ docker image inspect --format "{{ '{{' }}.RepoDigests}}" vaultwarden/web-vault:{{ vault_version }}
-#     [vaultwarden/web-vault@{{ vault_image_digest }}]
+#     $ docker pull docker.io/vaultwarden/web-vault:{{ vault_version }}
+#     $ docker image inspect --format "{{ '{{' }}.RepoDigests}}" docker.io/vaultwarden/web-vault:{{ vault_version }}
+#     [docker.io/vaultwarden/web-vault@{{ vault_image_digest }}]
 #
 # - Conversely, to get the tag name from the digest:
-#     $ docker image inspect --format "{{ '{{' }}.RepoTags}}" vaultwarden/web-vault@{{ vault_image_digest }}
-#     [vaultwarden/web-vault:{{ vault_version }}]
+#     $ docker image inspect --format "{{ '{{' }}.RepoTags}}" docker.io/vaultwarden/web-vault@{{ vault_image_digest }}
+#     [docker.io/vaultwarden/web-vault:{{ vault_version }}]
 #
-FROM vaultwarden/web-vault@{{ vault_image_digest }} as vault
+FROM docker.io/vaultwarden/web-vault@{{ vault_image_digest }} as vault
 
 ########################## BUILD IMAGE  ##########################
 FROM {{ build_stage_base_image }} as build
-
-
 
 # Build time options to avoid dpkg warnings and help with reproducible builds.
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -91,34 +91,36 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TZ=UTC \
     TERM=xterm-256color \
     CARGO_HOME="/root/.cargo" \
+    REGISTRIES_CRATES_IO_PROTOCOL=sparse \
     USER="root"
-
 
 # Create CARGO_HOME folder and don't download rust docs
 RUN {{ mount_rust_cache -}} mkdir -pv "${CARGO_HOME}" \
     && rustup set profile minimal
 
 {% if "alpine" in target_file %}
+# Use PostgreSQL v15 during Alpine/MUSL builds instead of the default v11
+# Debian Bookworm already contains libpq v15
+ENV PQ_LIB_DIR="/usr/local/musl/pq15/lib"
 {%   if "armv6" in target_file %}
-# To be able to build the armv6 image with mimalloc we need to specifically specify the libatomic.a file location
-ENV RUSTFLAGS='-Clink-arg=/usr/local/musl/{{ package_arch_target }}/lib/libatomic.a'
+# To be able to build the armv6 image with mimalloc we need to tell the linker to also look for libatomic
+ENV RUSTFLAGS='-Clink-arg=-latomic'
 {%   endif %}
 {% elif "arm" in target_file %}
-#
-# Install required build libs for {{ package_arch_name }} architecture.
-# hadolint ignore=DL3059
-RUN dpkg --add-architecture {{ package_arch_name }} \
+# Install build dependencies for the {{ package_arch_name }} architecture
+RUN {{ mount_rust_cache -}} dpkg --add-architecture {{ package_arch_name }} \
     && apt-get update \
     && apt-get install -y \
         --no-install-recommends \
-        libssl-dev{{ package_arch_prefix }} \
+        gcc-{{ package_cross_compiler }} \
         libc6-dev{{ package_arch_prefix }} \
-        libpq5{{ package_arch_prefix }} \
-        libpq-dev{{ package_arch_prefix }} \
-        libmariadb3{{ package_arch_prefix }} \
+        linux-libc-dev{{ package_arch_prefix }} \
         libmariadb-dev{{ package_arch_prefix }} \
         libmariadb-dev-compat{{ package_arch_prefix }} \
-        gcc-{{ package_cross_compiler }} \
+        libmariadb3{{ package_arch_prefix }} \
+        libpq-dev{{ package_arch_prefix }} \
+        libpq5{{ package_arch_prefix }} \
+        libssl-dev{{ package_arch_prefix }} \
     #
     # Make sure cargo has the right target config
     && echo '[target.{{ package_arch_target }}]' >> "${CARGO_HOME}/config" \
@@ -130,16 +132,13 @@ ENV CC_{{ package_arch_target | replace("-", "_") }}="/usr/bin/{{ package_cross_
     CROSS_COMPILE="1" \
     OPENSSL_INCLUDE_DIR="/usr/include/{{ package_cross_compiler }}" \
     OPENSSL_LIB_DIR="/usr/lib/{{ package_cross_compiler }}"
-
 {% elif "amd64" in target_file %}
-# Install DB packages
+# Install build dependencies
 RUN apt-get update \
     && apt-get install -y \
         --no-install-recommends \
-        libmariadb-dev{{ package_arch_prefix }} \
-        libpq-dev{{ package_arch_prefix }} \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+        libmariadb-dev \
+        libpq-dev
 {% endif %}
 
 # Creates a dummy project used to grab dependencies
@@ -148,7 +147,7 @@ WORKDIR /app
 
 # Copies over *only* your manifests and build files
 COPY ./Cargo.* ./
-COPY ./rust-toolchain ./rust-toolchain
+COPY ./rust-toolchain.toml ./rust-toolchain.toml
 COPY ./build.rs ./build.rs
 
 {% if package_arch_target is defined %}
@@ -178,7 +177,6 @@ RUN touch src/main.rs
 
 # Builds again, this time it'll just be
 # your actual source files being built
-# hadolint ignore=DL3059
 RUN {{ mount_rust_cache -}} cargo build --features ${DB} --release{{ package_arch_target_param }}
 
 ######################## RUNTIME IMAGE  ########################
@@ -195,7 +193,6 @@ ENV ROCKET_PROFILE="release" \
 
 
 {% if "amd64" not in target_file %}
-# hadolint ignore=DL3059
 RUN [ "cross-build-start" ]
 {% endif %}
 
@@ -203,32 +200,23 @@ RUN [ "cross-build-start" ]
 RUN mkdir /data \
 {% if "alpine" in runtime_stage_base_image %}
     && apk add --no-cache \
-        openssl \
-        tzdata \
+        ca-certificates \
         curl \
-        ca-certificates
+        openssl \
+        tzdata
 {% else %}
     && apt-get update && apt-get install -y \
     --no-install-recommends \
-    openssl \
     ca-certificates \
     curl \
     libmariadb-dev-compat \
     libpq5 \
+    openssl \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 {% endif %}
 
-{% if "armv6" in target_file and "alpine" not in target_file %}
-# In the Balena Bullseye images for armv6/rpi-debian there is a missing symlink.
-# This symlink was there in the buster images, and for some reason this is needed.
-# hadolint ignore=DL3059
-RUN ln -v -s /lib/ld-linux-armhf.so.3 /lib/ld-linux.so.3
-
-{% endif -%}
-
 {% if "amd64" not in target_file %}
-# hadolint ignore=DL3059
 RUN [ "cross-build-end" ]
 {% endif %}
 

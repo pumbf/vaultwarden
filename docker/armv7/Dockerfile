@@ -2,7 +2,6 @@
 
 # This file was generated using a Jinja2 template.
 # Please make your changes in `Dockerfile.j2` and then `make` the individual Dockerfiles.
-
 # Using multistage build:
 # 	https://docs.docker.com/develop/develop-images/multistage-build/
 # 	https://whitfin.io/speeding-up-rust-docker-builds/
@@ -16,20 +15,18 @@
 # - From https://hub.docker.com/r/vaultwarden/web-vault/tags,
 #   click the tag name to view the digest of the image it currently points to.
 # - From the command line:
-#     $ docker pull vaultwarden/web-vault:v2022.9.0
-#     $ docker image inspect --format "{{.RepoDigests}}" vaultwarden/web-vault:v2022.9.0
-#     [vaultwarden/web-vault@sha256:99d21235a64084c9115f4aa3da1298881b8bbf146c0d48d6530b4d685a6a6fbc]
+#     $ docker pull docker.io/vaultwarden/web-vault:v2023.8.2
+#     $ docker image inspect --format "{{.RepoDigests}}" docker.io/vaultwarden/web-vault:v2023.8.2
+#     [docker.io/vaultwarden/web-vault@sha256:b361e79309ef2c4368f880f350166daade41eb0927a9adf376c76e3713027252]
 #
 # - Conversely, to get the tag name from the digest:
-#     $ docker image inspect --format "{{.RepoTags}}" vaultwarden/web-vault@sha256:99d21235a64084c9115f4aa3da1298881b8bbf146c0d48d6530b4d685a6a6fbc
-#     [vaultwarden/web-vault:v2022.9.0]
+#     $ docker image inspect --format "{{.RepoTags}}" docker.io/vaultwarden/web-vault@sha256:b361e79309ef2c4368f880f350166daade41eb0927a9adf376c76e3713027252
+#     [docker.io/vaultwarden/web-vault:v2023.8.2]
 #
-FROM vaultwarden/web-vault@sha256:99d21235a64084c9115f4aa3da1298881b8bbf146c0d48d6530b4d685a6a6fbc as vault
+FROM docker.io/vaultwarden/web-vault@sha256:b361e79309ef2c4368f880f350166daade41eb0927a9adf376c76e3713027252 as vault
 
 ########################## BUILD IMAGE  ##########################
-FROM rust:1.61-bullseye as build
-
-
+FROM docker.io/library/rust:1.72.0-bookworm as build
 
 # Build time options to avoid dpkg warnings and help with reproducible builds.
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -37,28 +34,27 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TZ=UTC \
     TERM=xterm-256color \
     CARGO_HOME="/root/.cargo" \
+    REGISTRIES_CRATES_IO_PROTOCOL=sparse \
     USER="root"
-
 
 # Create CARGO_HOME folder and don't download rust docs
 RUN mkdir -pv "${CARGO_HOME}" \
     && rustup set profile minimal
 
-#
-# Install required build libs for armhf architecture.
-# hadolint ignore=DL3059
+# Install build dependencies for the armhf architecture
 RUN dpkg --add-architecture armhf \
     && apt-get update \
     && apt-get install -y \
         --no-install-recommends \
-        libssl-dev:armhf \
+        gcc-arm-linux-gnueabihf \
         libc6-dev:armhf \
-        libpq5:armhf \
-        libpq-dev:armhf \
-        libmariadb3:armhf \
+        linux-libc-dev:armhf \
         libmariadb-dev:armhf \
         libmariadb-dev-compat:armhf \
-        gcc-arm-linux-gnueabihf \
+        libmariadb3:armhf \
+        libpq-dev:armhf \
+        libpq5:armhf \
+        libssl-dev:armhf \
     #
     # Make sure cargo has the right target config
     && echo '[target.armv7-unknown-linux-gnueabihf]' >> "${CARGO_HOME}/config" \
@@ -71,14 +67,13 @@ ENV CC_armv7_unknown_linux_gnueabihf="/usr/bin/arm-linux-gnueabihf-gcc" \
     OPENSSL_INCLUDE_DIR="/usr/include/arm-linux-gnueabihf" \
     OPENSSL_LIB_DIR="/usr/lib/arm-linux-gnueabihf"
 
-
 # Creates a dummy project used to grab dependencies
 RUN USER=root cargo new --bin /app
 WORKDIR /app
 
 # Copies over *only* your manifests and build files
 COPY ./Cargo.* ./
-COPY ./rust-toolchain ./rust-toolchain
+COPY ./rust-toolchain.toml ./rust-toolchain.toml
 COPY ./build.rs ./build.rs
 
 RUN rustup target add armv7-unknown-linux-gnueabihf
@@ -101,34 +96,31 @@ RUN touch src/main.rs
 
 # Builds again, this time it'll just be
 # your actual source files being built
-# hadolint ignore=DL3059
 RUN cargo build --features ${DB} --release --target=armv7-unknown-linux-gnueabihf
 
 ######################## RUNTIME IMAGE  ########################
 # Create a new stage with a minimal image
 # because we already have a binary built
-FROM balenalib/armv7hf-debian:bullseye
+FROM docker.io/balenalib/armv7hf-debian:bookworm
 
 ENV ROCKET_PROFILE="release" \
     ROCKET_ADDRESS=0.0.0.0 \
     ROCKET_PORT=80
 
-# hadolint ignore=DL3059
 RUN [ "cross-build-start" ]
 
 # Create data folder and Install needed libraries
 RUN mkdir /data \
     && apt-get update && apt-get install -y \
     --no-install-recommends \
-    openssl \
     ca-certificates \
     curl \
     libmariadb-dev-compat \
     libpq5 \
+    openssl \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# hadolint ignore=DL3059
 RUN [ "cross-build-end" ]
 
 VOLUME /data

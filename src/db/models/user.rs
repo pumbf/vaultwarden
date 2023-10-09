@@ -6,9 +6,9 @@ use crate::CONFIG;
 
 db_object! {
     #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
-    #[table_name = "users"]
-    #[changeset_options(treat_none_as_null="true")]
-    #[primary_key(uuid)]
+    #[diesel(table_name = users)]
+    #[diesel(treat_none_as_null = true)]
+    #[diesel(primary_key(uuid))]
     pub struct User {
         pub uuid: String,
         pub enabled: bool,
@@ -32,7 +32,7 @@ db_object! {
         pub private_key: Option<String>,
         pub public_key: Option<String>,
 
-        #[column_name = "totp_secret"] // Note, this is only added to the UserDb structs, not to User
+        #[diesel(column_name = "totp_secret")] // Note, this is only added to the UserDb structs, not to User
         _totp_secret: Option<String>,
         pub totp_recover: Option<String>,
 
@@ -44,16 +44,27 @@ db_object! {
 
         pub client_kdf_type: i32,
         pub client_kdf_iter: i32,
+        pub client_kdf_memory: Option<i32>,
+        pub client_kdf_parallelism: Option<i32>,
 
         pub api_key: Option<String>,
+
+        pub avatar_color: Option<String>,
+
+        pub external_id: Option<String>,
     }
 
     #[derive(Identifiable, Queryable, Insertable)]
-    #[table_name = "invitations"]
-    #[primary_key(email)]
+    #[diesel(table_name = invitations)]
+    #[diesel(primary_key(email))]
     pub struct Invitation {
         pub email: String,
     }
+}
+
+pub enum UserKdfType {
+    Pbkdf2 = 0,
+    Argon2id = 1,
 }
 
 enum UserStatus {
@@ -71,8 +82,8 @@ pub struct UserStampException {
 
 /// Local methods
 impl User {
-    pub const CLIENT_KDF_TYPE_DEFAULT: i32 = 0; // PBKDF2: 0
-    pub const CLIENT_KDF_ITER_DEFAULT: i32 = 100_000;
+    pub const CLIENT_KDF_TYPE_DEFAULT: i32 = UserKdfType::Pbkdf2 as i32;
+    pub const CLIENT_KDF_ITER_DEFAULT: i32 = 600_000;
 
     pub fn new(email: String) -> Self {
         let now = Utc::now().naive_utc();
@@ -93,7 +104,7 @@ impl User {
             email_new_token: None,
 
             password_hash: Vec::new(),
-            salt: crypto::get_random_64(),
+            salt: crypto::get_random_bytes::<64>().to_vec(),
             password_iterations: CONFIG.password_iterations(),
 
             security_stamp: crate::util::get_uuid(),
@@ -111,8 +122,14 @@ impl User {
 
             client_kdf_type: Self::CLIENT_KDF_TYPE_DEFAULT,
             client_kdf_iter: Self::CLIENT_KDF_ITER_DEFAULT,
+            client_kdf_memory: None,
+            client_kdf_parallelism: None,
 
             api_key: None,
+
+            avatar_color: None,
+
+            external_id: None,
         }
     }
 
@@ -137,24 +154,49 @@ impl User {
         matches!(self.api_key, Some(ref api_key) if crate::crypto::ct_eq(api_key, key))
     }
 
+    pub fn set_external_id(&mut self, external_id: Option<String>) {
+        //Check if external id is empty. We don't want to have
+        //empty strings in the database
+        let mut ext_id: Option<String> = None;
+        if let Some(external_id) = external_id {
+            if !external_id.is_empty() {
+                ext_id = Some(external_id);
+            }
+        }
+        self.external_id = ext_id;
+    }
+
     /// Set the password hash generated
     /// And resets the security_stamp. Based upon the allow_next_route the security_stamp will be different.
     ///
     /// # Arguments
     ///
     /// * `password` - A str which contains a hashed version of the users master password.
+    /// * `new_key` - A String  which contains the new aKey value of the users master password.
     /// * `allow_next_route` - A Option<Vec<String>> with the function names of the next allowed (rocket) routes.
     ///                       These routes are able to use the previous stamp id for the next 2 minutes.
     ///                       After these 2 minutes this stamp will expire.
     ///
-    pub fn set_password(&mut self, password: &str, allow_next_route: Option<Vec<String>>) {
+    pub fn set_password(
+        &mut self,
+        password: &str,
+        new_key: Option<String>,
+        reset_security_stamp: bool,
+        allow_next_route: Option<Vec<String>>,
+    ) {
         self.password_hash = crypto::hash_password(password.as_bytes(), &self.salt, self.password_iterations as u32);
 
         if let Some(route) = allow_next_route {
             self.set_stamp_exception(route);
         }
 
-        self.reset_security_stamp()
+        if let Some(new_key) = new_key {
+            self.akey = new_key;
+        }
+
+        if reset_security_stamp {
+            self.reset_security_stamp()
+        }
     }
 
     pub fn reset_security_stamp(&mut self) {
@@ -192,18 +234,13 @@ use crate::db::DbConn;
 use crate::api::EmptyResult;
 use crate::error::MapResult;
 
-use futures::{stream, stream::StreamExt};
-
 /// Database methods
 impl User {
-    pub async fn to_json(&self, conn: &DbConn) -> Value {
-        let orgs_json = stream::iter(UserOrganization::find_confirmed_by_user(&self.uuid, conn).await)
-            .then(|c| async {
-                let c = c; // Move out this single variable
-                c.to_json(conn).await
-            })
-            .collect::<Vec<Value>>()
-            .await;
+    pub async fn to_json(&self, conn: &mut DbConn) -> Value {
+        let mut orgs_json = Vec::new();
+        for c in UserOrganization::find_confirmed_by_user(&self.uuid, conn).await {
+            orgs_json.push(c.to_json(conn).await);
+        }
 
         let twofactor_enabled = !TwoFactor::find_by_user(&self.uuid, conn).await.is_empty();
 
@@ -231,11 +268,12 @@ impl User {
             "Providers": [],
             "ProviderOrganizations": [],
             "ForcePasswordReset": false,
+            "AvatarColor": self.avatar_color,
             "Object": "profile",
         })
     }
 
-    pub async fn save(&mut self, conn: &DbConn) -> EmptyResult {
+    pub async fn save(&mut self, conn: &mut DbConn) -> EmptyResult {
         if self.email.trim().is_empty() {
             err!("User email can't be empty")
         }
@@ -273,7 +311,7 @@ impl User {
         }
     }
 
-    pub async fn delete(self, conn: &DbConn) -> EmptyResult {
+    pub async fn delete(self, conn: &mut DbConn) -> EmptyResult {
         for user_org in UserOrganization::find_confirmed_by_user(&self.uuid, conn).await {
             if user_org.atype == UserOrgType::Owner
                 && UserOrganization::count_confirmed_by_org_and_type(&user_org.org_uuid, UserOrgType::Owner, conn).await
@@ -301,13 +339,13 @@ impl User {
         }}
     }
 
-    pub async fn update_uuid_revision(uuid: &str, conn: &DbConn) {
+    pub async fn update_uuid_revision(uuid: &str, conn: &mut DbConn) {
         if let Err(e) = Self::_update_revision(uuid, &Utc::now().naive_utc(), conn).await {
             warn!("Failed to update revision for {}: {:#?}", uuid, e);
         }
     }
 
-    pub async fn update_all_revisions(conn: &DbConn) -> EmptyResult {
+    pub async fn update_all_revisions(conn: &mut DbConn) -> EmptyResult {
         let updated_at = Utc::now().naive_utc();
 
         db_run! {conn: {
@@ -320,13 +358,13 @@ impl User {
         }}
     }
 
-    pub async fn update_revision(&mut self, conn: &DbConn) -> EmptyResult {
+    pub async fn update_revision(&mut self, conn: &mut DbConn) -> EmptyResult {
         self.updated_at = Utc::now().naive_utc();
 
         Self::_update_revision(&self.uuid, &self.updated_at, conn).await
     }
 
-    async fn _update_revision(uuid: &str, date: &NaiveDateTime, conn: &DbConn) -> EmptyResult {
+    async fn _update_revision(uuid: &str, date: &NaiveDateTime, conn: &mut DbConn) -> EmptyResult {
         db_run! {conn: {
             crate::util::retry(|| {
                 diesel::update(users::table.filter(users::uuid.eq(uuid)))
@@ -337,7 +375,7 @@ impl User {
         }}
     }
 
-    pub async fn find_by_mail(mail: &str, conn: &DbConn) -> Option<Self> {
+    pub async fn find_by_mail(mail: &str, conn: &mut DbConn) -> Option<Self> {
         let lower_mail = mail.to_lowercase();
         db_run! {conn: {
             users::table
@@ -348,19 +386,25 @@ impl User {
         }}
     }
 
-    pub async fn find_by_uuid(uuid: &str, conn: &DbConn) -> Option<Self> {
+    pub async fn find_by_uuid(uuid: &str, conn: &mut DbConn) -> Option<Self> {
         db_run! {conn: {
             users::table.filter(users::uuid.eq(uuid)).first::<UserDb>(conn).ok().from_db()
         }}
     }
 
-    pub async fn get_all(conn: &DbConn) -> Vec<Self> {
+    pub async fn find_by_external_id(id: &str, conn: &mut DbConn) -> Option<Self> {
+        db_run! {conn: {
+            users::table.filter(users::external_id.eq(id)).first::<UserDb>(conn).ok().from_db()
+        }}
+    }
+
+    pub async fn get_all(conn: &mut DbConn) -> Vec<Self> {
         db_run! {conn: {
             users::table.load::<UserDb>(conn).expect("Error loading users").from_db()
         }}
     }
 
-    pub async fn last_active(&self, conn: &DbConn) -> Option<NaiveDateTime> {
+    pub async fn last_active(&self, conn: &mut DbConn) -> Option<NaiveDateTime> {
         match Device::find_latest_active_by_user(&self.uuid, conn).await {
             Some(device) => Some(device.updated_at),
             None => None,
@@ -369,14 +413,14 @@ impl User {
 }
 
 impl Invitation {
-    pub fn new(email: String) -> Self {
+    pub fn new(email: &str) -> Self {
         let email = email.to_lowercase();
         Self {
             email,
         }
     }
 
-    pub async fn save(&self, conn: &DbConn) -> EmptyResult {
+    pub async fn save(&self, conn: &mut DbConn) -> EmptyResult {
         if self.email.trim().is_empty() {
             err!("Invitation email can't be empty")
         }
@@ -401,7 +445,7 @@ impl Invitation {
         }
     }
 
-    pub async fn delete(self, conn: &DbConn) -> EmptyResult {
+    pub async fn delete(self, conn: &mut DbConn) -> EmptyResult {
         db_run! {conn: {
             diesel::delete(invitations::table.filter(invitations::email.eq(self.email)))
                 .execute(conn)
@@ -409,7 +453,7 @@ impl Invitation {
         }}
     }
 
-    pub async fn find_by_mail(mail: &str, conn: &DbConn) -> Option<Self> {
+    pub async fn find_by_mail(mail: &str, conn: &mut DbConn) -> Option<Self> {
         let lower_mail = mail.to_lowercase();
         db_run! {conn: {
             invitations::table
@@ -420,7 +464,7 @@ impl Invitation {
         }}
     }
 
-    pub async fn take(mail: &str, conn: &DbConn) -> bool {
+    pub async fn take(mail: &str, conn: &mut DbConn) -> bool {
         match Self::find_by_mail(mail, conn).await {
             Some(invitation) => invitation.delete(conn).await.is_ok(),
             None => false,

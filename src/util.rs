@@ -1,7 +1,10 @@
 //
 // Web Headers and caching
 //
-use std::io::Cursor;
+use std::{
+    io::{Cursor, ErrorKind},
+    ops::Deref,
+};
 
 use rocket::{
     fairing::{Fairing, Info, Kind},
@@ -42,14 +45,6 @@ impl Fairing for AppHeaders {
         // This can cause issues when some MFA requests needs to open a popup or page within the clients like WebAuthn, or Duo.
         // This is the same behaviour as upstream Bitwarden.
         if !req_uri_path.ends_with("connector.html") {
-            // Check if we are requesting an admin page, if so, allow unsafe-inline for scripts.
-            // TODO: In the future maybe we need to see if we can generate a sha256 hash or have no scripts inline at all.
-            let admin_path = format!("{}/admin", CONFIG.domain_path());
-            let mut script_src = "";
-            if req_uri_path.starts_with(admin_path.as_str()) {
-                script_src = " 'unsafe-inline'";
-            }
-
             // # Frame Ancestors:
             // Chrome Web Store: https://chrome.google.com/webstore/detail/bitwarden-free-password-m/nngceckbapebfimnlniiiahkandclblb
             // Edge Add-ons: https://microsoftedge.microsoft.com/addons/detail/bitwarden-free-password/jbkfoedolllekgbhcbcoahefnbanhhlh?hl=en-US
@@ -58,21 +53,38 @@ impl Fairing for AppHeaders {
             // Have I Been Pwned and Gravator to allow those calls to work.
             // # Connect src:
             // Leaked Passwords check: api.pwnedpasswords.com
-            // 2FA/MFA Site check: 2fa.directory
+            // 2FA/MFA Site check: api.2fa.directory
             // # Mail Relay: https://bitwarden.com/blog/add-privacy-and-security-using-email-aliases-with-bitwarden/
-            // app.simplelogin.io, app.anonaddy.com, api.fastmail.com
+            // app.simplelogin.io, app.anonaddy.com, api.fastmail.com, quack.duckduckgo.com
             let csp = format!(
                 "default-src 'self'; \
-                script-src 'self'{script_src}; \
+                base-uri 'self'; \
+                form-action 'self'; \
+                object-src 'self' blob:; \
+                script-src 'self' 'wasm-unsafe-eval'; \
                 style-src 'self' 'unsafe-inline'; \
-                img-src 'self' data: https://haveibeenpwned.com/ https://www.gravatar.com {icon_service_csp}; \
                 child-src 'self' https://*.duosecurity.com https://*.duofederal.com; \
                 frame-src 'self' https://*.duosecurity.com https://*.duofederal.com; \
-                connect-src 'self' https://api.pwnedpasswords.com/range/ https://2fa.directory/api/ https://app.simplelogin.io/api/ https://app.anonaddy.com/api/ https://api.fastmail.com/; \
-                object-src 'self' blob:; \
-                frame-ancestors 'self' chrome-extension://nngceckbapebfimnlniiiahkandclblb chrome-extension://jbkfoedolllekgbhcbcoahefnbanhhlh moz-extension://* {allowed_iframe_ancestors};",
-                icon_service_csp=CONFIG._icon_service_csp(),
-                allowed_iframe_ancestors=CONFIG.allowed_iframe_ancestors()
+                frame-ancestors 'self' \
+                  chrome-extension://nngceckbapebfimnlniiiahkandclblb \
+                  chrome-extension://jbkfoedolllekgbhcbcoahefnbanhhlh \
+                  moz-extension://* \
+                  {allowed_iframe_ancestors}; \
+                img-src 'self' data: \
+                  https://haveibeenpwned.com \
+                  https://www.gravatar.com \
+                  {icon_service_csp}; \
+                connect-src 'self' \
+                  https://api.pwnedpasswords.com \
+                  https://api.2fa.directory \
+                  https://app.simplelogin.io/api/ \
+                  https://app.anonaddy.com/api/ \
+                  https://api.fastmail.com/ \
+                  https://api.forwardemail.net \
+                  ;\
+                ",
+                icon_service_csp = CONFIG._icon_service_csp(),
+                allowed_iframe_ancestors = CONFIG.allowed_iframe_ancestors()
             );
             res.set_raw_header("Content-Security-Policy", csp);
             res.set_raw_header("X-Frame-Options", "SAMEORIGIN");
@@ -94,7 +106,7 @@ impl Cors {
     fn get_header(headers: &HeaderMap<'_>, name: &str) -> String {
         match headers.get_one(name) {
             Some(h) => h.to_string(),
-            _ => "".to_string(),
+            _ => String::new(),
         }
     }
 
@@ -201,6 +213,14 @@ impl std::fmt::Display for SafeString {
     }
 }
 
+impl Deref for SafeString {
+    type Target = String;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl AsRef<Path> for SafeString {
     #[inline]
     fn as_ref(&self) -> &Path {
@@ -223,8 +243,7 @@ impl<'r> FromParam<'r> for SafeString {
 
 // Log all the routes from the main paths list, and the attachments endpoint
 // Effectively ignores, any static file route, and the alive endpoint
-const LOGGED_ROUTES: [&str; 6] =
-    ["/api", "/admin", "/identity", "/icons", "/notifications/hub/negotiate", "/attachments"];
+const LOGGED_ROUTES: [&str; 7] = ["/api", "/admin", "/identity", "/icons", "/attachments", "/events", "/notifications"];
 
 // Boolean is extra debug, when true, we ignore the whitelist above and also print the mounts
 pub struct BetterLogging(pub bool);
@@ -311,7 +330,16 @@ pub fn file_exists(path: &str) -> bool {
 
 pub fn write_file(path: &str, content: &[u8]) -> Result<(), crate::error::Error> {
     use std::io::Write;
-    let mut f = File::create(path)?;
+    let mut f = match File::create(path) {
+        Ok(file) => file,
+        Err(e) => {
+            if e.kind() == ErrorKind::PermissionDenied {
+                error!("Can't create '{}': Permission denied", path);
+            }
+            return Err(From::from(e));
+        }
+    };
+
     f.write_all(content)?;
     f.flush()?;
     Ok(())
@@ -357,11 +385,21 @@ pub fn get_uuid() -> String {
 
 use std::str::FromStr;
 
+#[inline]
 pub fn upcase_first(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
         None => String::new(),
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+    }
+}
+
+#[inline]
+pub fn lcase_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
     }
 }
 
@@ -384,16 +422,16 @@ where
 use std::env;
 
 pub fn get_env_str_value(key: &str) -> Option<String> {
-    let key_file = format!("{}_FILE", key);
+    let key_file = format!("{key}_FILE");
     let value_from_env = env::var(key);
     let value_file = env::var(&key_file);
 
     match (value_from_env, value_file) {
-        (Ok(_), Ok(_)) => panic!("You should not define both {} and {}!", key, key_file),
+        (Ok(_), Ok(_)) => panic!("You should not define both {key} and {key_file}!"),
         (Ok(v_env), Err(_)) => Some(v_env),
         (Err(_), Ok(v_file)) => match fs::read_to_string(v_file) {
             Ok(content) => Some(content.trim().to_string()),
-            Err(e) => panic!("Failed to load {}: {:?}", key, e),
+            Err(e) => panic!("Failed to load {key}: {e:?}"),
         },
         _ => None,
     }
@@ -423,10 +461,13 @@ pub fn get_env_bool(key: &str) -> Option<bool> {
 
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 
+// Format used by Bitwarden API
+const DATETIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6fZ";
+
 /// Formats a UTC-offset `NaiveDateTime` in the format used by Bitwarden API
 /// responses with "date" fields (`CreationDate`, `RevisionDate`, etc.).
 pub fn format_date(dt: &NaiveDateTime) -> String {
-    dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+    dt.format(DATETIME_FORMAT).to_string()
 }
 
 /// Formats a `DateTime<Local>` using the specified format string.
@@ -460,11 +501,15 @@ pub fn format_naive_datetime_local(dt: &NaiveDateTime, fmt: &str) -> String {
 ///
 /// https://httpwg.org/specs/rfc7231.html#http.date
 pub fn format_datetime_http(dt: &DateTime<Local>) -> String {
-    let expiry_time: chrono::DateTime<chrono::Utc> = chrono::DateTime::from_utc(dt.naive_utc(), chrono::Utc);
+    let expiry_time = DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt.naive_utc(), chrono::Utc);
 
     // HACK: HTTP expects the date to always be GMT (UTC) rather than giving an
     // offset (which would always be 0 in UTC anyway)
     expiry_time.to_rfc2822().replace("+0000", "GMT")
+}
+
+pub fn parse_date(date: &str) -> NaiveDateTime {
+    NaiveDateTime::parse_from_str(date, DATETIME_FORMAT).unwrap()
 }
 
 //
@@ -478,13 +523,13 @@ pub fn is_running_in_docker() -> bool {
 
 /// Simple check to determine on which docker base image vaultwarden is running.
 /// We build images based upon Debian or Alpine, so these we check here.
-pub fn docker_base_image() -> String {
+pub fn docker_base_image() -> &'static str {
     if Path::new("/etc/debian_version").exists() {
-        "Debian".to_string()
+        "Debian"
     } else if Path::new("/etc/alpine-release").exists() {
-        "Alpine".to_string()
+        "Alpine"
     } else {
-        "Unknown".to_string()
+        "Unknown"
     }
 }
 
@@ -554,7 +599,7 @@ impl<'de> Visitor<'de> for UpCaseVisitor {
 
 fn upcase_value(value: Value) -> Value {
     if let Value::Object(map) = value {
-        let mut new_value = json!({});
+        let mut new_value = Value::Object(serde_json::Map::new());
 
         for (key, val) in map.into_iter() {
             let processed_key = _process_key(&key);
@@ -563,7 +608,7 @@ fn upcase_value(value: Value) -> Value {
         new_value
     } else if let Value::Array(array) = value {
         // Initialize array with null values
-        let mut new_value = json!(vec![Value::Null; array.len()]);
+        let mut new_value = Value::Array(vec![Value::Null; array.len()]);
 
         for (index, val) in array.into_iter().enumerate() {
             new_value[index] = upcase_value(val);
@@ -587,9 +632,9 @@ fn _process_key(key: &str) -> String {
 // Retry methods
 //
 
-pub fn retry<F, T, E>(func: F, max_tries: u32) -> Result<T, E>
+pub fn retry<F, T, E>(mut func: F, max_tries: u32) -> Result<T, E>
 where
-    F: Fn() -> Result<T, E>,
+    F: FnMut() -> Result<T, E>,
 {
     let mut tries = 0;
 
@@ -602,15 +647,15 @@ where
                 if tries >= max_tries {
                     return err;
                 }
-                Handle::current().block_on(async move { sleep(Duration::from_millis(500)).await });
+                Handle::current().block_on(sleep(Duration::from_millis(500)));
             }
         }
     }
 }
 
-pub async fn retry_db<F, T, E>(func: F, max_tries: u32) -> Result<T, E>
+pub async fn retry_db<F, T, E>(mut func: F, max_tries: u32) -> Result<T, E>
 where
-    F: Fn() -> Result<T, E>,
+    F: FnMut() -> Result<T, E>,
     E: std::error::Error,
 {
     let mut tries = 0;
@@ -649,4 +694,47 @@ pub fn get_reqwest_client_builder() -> ClientBuilder {
     let mut headers = header::HeaderMap::new();
     headers.insert(header::USER_AGENT, header::HeaderValue::from_static("Vaultwarden"));
     Client::builder().default_headers(headers).timeout(Duration::from_secs(10))
+}
+
+pub fn convert_json_key_lcase_first(src_json: Value) -> Value {
+    match src_json {
+        Value::Array(elm) => {
+            let mut new_array: Vec<Value> = Vec::with_capacity(elm.len());
+
+            for obj in elm {
+                new_array.push(convert_json_key_lcase_first(obj));
+            }
+            Value::Array(new_array)
+        }
+
+        Value::Object(obj) => {
+            let mut json_map = JsonMap::new();
+            for (key, value) in obj.iter() {
+                match (key, value) {
+                    (key, Value::Object(elm)) => {
+                        let inner_value = convert_json_key_lcase_first(Value::Object(elm.clone()));
+                        json_map.insert(lcase_first(key), inner_value);
+                    }
+
+                    (key, Value::Array(elm)) => {
+                        let mut inner_array: Vec<Value> = Vec::with_capacity(elm.len());
+
+                        for inner_obj in elm {
+                            inner_array.push(convert_json_key_lcase_first(inner_obj.clone()));
+                        }
+
+                        json_map.insert(lcase_first(key), Value::Array(inner_array));
+                    }
+
+                    (key, value) => {
+                        json_map.insert(lcase_first(key), value.clone());
+                    }
+                }
+            }
+
+            Value::Object(json_map)
+        }
+
+        value => value,
+    }
 }

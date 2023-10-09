@@ -12,9 +12,13 @@
     clippy::equatable_if_let,
     clippy::float_cmp_const,
     clippy::inefficient_to_string,
+    clippy::iter_on_empty_collections,
+    clippy::iter_on_single_items,
     clippy::linkedlist,
     clippy::macro_use_imports,
     clippy::manual_assert,
+    clippy::manual_instant_elapsed,
+    clippy::manual_string_new,
     clippy::match_wildcard_for_single_variants,
     clippy::mem_forget,
     clippy::string_add_assign,
@@ -30,7 +34,7 @@
 // The more key/value pairs there are the more recursion occurs.
 // We want to keep this as low as possible, but not higher then 128.
 // If you go above 128 it will cause rust-analyzer to fail,
-#![recursion_limit = "87"]
+#![recursion_limit = "103"]
 
 // When enabled use MiMalloc as malloc instead of the default malloc
 #[cfg(feature = "enable_mimalloc")]
@@ -78,9 +82,12 @@ mod mail;
 mod ratelimit;
 mod util;
 
+use crate::api::purge_auth_requests;
+use crate::api::WS_ANONYMOUS_SUBSCRIPTIONS;
 pub use config::CONFIG;
 pub use error::{Error, MapResult};
 use rocket::data::{Limits, ToByteUnit};
+use std::sync::Arc;
 pub use util::is_running_in_docker;
 
 #[rocket::main]
@@ -107,21 +114,29 @@ async fn main() -> Result<(), Error> {
     create_dir(&CONFIG.attachments_folder(), "attachments folder");
 
     let pool = create_db_pool().await;
-    schedule_jobs(pool.clone()).await;
-    crate::db::models::TwoFactor::migrate_u2f_to_webauthn(&pool.get().await.unwrap()).await.unwrap();
+    schedule_jobs(pool.clone());
+    crate::db::models::TwoFactor::migrate_u2f_to_webauthn(&mut pool.get().await.unwrap()).await.unwrap();
 
     launch_rocket(pool, extra_debug).await // Blocks until program termination.
 }
 
 const HELP: &str = "\
-        Alternative implementation of the Bitwarden server API written in Rust
+Alternative implementation of the Bitwarden server API written in Rust
 
-        USAGE:
-            vaultwarden
+USAGE:
+    vaultwarden [FLAGS|COMMAND]
 
-        FLAGS:
-            -h, --help       Prints help information
-            -v, --version    Prints the app version
+FLAGS:
+    -h, --help       Prints help information
+    -v, --version    Prints the app version
+
+COMMAND:
+    hash [--preset {bitwarden|owasp}]  Generate an Argon2id PHC ADMIN_TOKEN
+
+PRESETS:                  m=         t=          p=
+    bitwarden (default) 64MiB, 3 Iterations, 4 Threads
+    owasp               19MiB, 2 Iterations, 1 Thread
+
 ";
 
 pub const VERSION: Option<&str> = option_env!("VW_VERSION");
@@ -131,31 +146,95 @@ fn parse_args() {
     let version = VERSION.unwrap_or("(Version info from Git not present)");
 
     if pargs.contains(["-h", "--help"]) {
-        println!("vaultwarden {}", version);
-        print!("{}", HELP);
+        println!("vaultwarden {version}");
+        print!("{HELP}");
         exit(0);
     } else if pargs.contains(["-v", "--version"]) {
-        println!("vaultwarden {}", version);
+        println!("vaultwarden {version}");
+        exit(0);
+    }
+
+    if let Some(command) = pargs.subcommand().unwrap_or_default() {
+        if command == "hash" {
+            use argon2::{
+                password_hash::SaltString, Algorithm::Argon2id, Argon2, ParamsBuilder, PasswordHasher, Version::V0x13,
+            };
+
+            let mut argon2_params = ParamsBuilder::new();
+            let preset: Option<String> = pargs.opt_value_from_str(["-p", "--preset"]).unwrap_or_default();
+            let selected_preset;
+            match preset.as_deref() {
+                Some("owasp") => {
+                    selected_preset = "owasp";
+                    argon2_params.m_cost(19456);
+                    argon2_params.t_cost(2);
+                    argon2_params.p_cost(1);
+                }
+                _ => {
+                    // Bitwarden preset is the default
+                    selected_preset = "bitwarden";
+                    argon2_params.m_cost(65540);
+                    argon2_params.t_cost(3);
+                    argon2_params.p_cost(4);
+                }
+            }
+
+            println!("Generate an Argon2id PHC string using the '{selected_preset}' preset:\n");
+
+            let password = rpassword::prompt_password("Password: ").unwrap();
+            if password.len() < 8 {
+                println!("\nPassword must contain at least 8 characters");
+                exit(1);
+            }
+
+            let password_verify = rpassword::prompt_password("Confirm Password: ").unwrap();
+            if password != password_verify {
+                println!("\nPasswords do not match");
+                exit(1);
+            }
+
+            let argon2 = Argon2::new(Argon2id, V0x13, argon2_params.build().unwrap());
+            let salt = SaltString::encode_b64(&crate::crypto::get_random_bytes::<32>()).unwrap();
+
+            let argon2_timer = tokio::time::Instant::now();
+            if let Ok(password_hash) = argon2.hash_password(password.as_bytes(), &salt) {
+                println!(
+                    "\n\
+                    ADMIN_TOKEN='{password_hash}'\n\n\
+                    Generation of the Argon2id PHC string took: {:?}",
+                    argon2_timer.elapsed()
+                );
+            } else {
+                error!("Unable to generate Argon2id PHC hash.");
+                exit(1);
+            }
+        }
         exit(0);
     }
 }
-
 fn launch_info() {
-    println!("/--------------------------------------------------------------------\\");
-    println!("|                        Starting Vaultwarden                        |");
+    println!(
+        "\
+        /--------------------------------------------------------------------\\\n\
+        |                        Starting Vaultwarden                        |"
+    );
 
     if let Some(version) = VERSION {
-        println!("|{:^68}|", format!("Version {}", version));
+        println!("|{:^68}|", format!("Version {version}"));
     }
 
-    println!("|--------------------------------------------------------------------|");
-    println!("| This is an *unofficial* Bitwarden implementation, DO NOT use the   |");
-    println!("| official channels to report bugs/features, regardless of client.   |");
-    println!("| Send usage/configuration questions or feature requests to:         |");
-    println!("|   https://vaultwarden.discourse.group/                             |");
-    println!("| Report suspected bugs/issues in the software itself at:            |");
-    println!("|   https://github.com/dani-garcia/vaultwarden/issues/new            |");
-    println!("\\--------------------------------------------------------------------/\n");
+    println!(
+        "\
+        |--------------------------------------------------------------------|\n\
+        | This is an *unofficial* Bitwarden implementation, DO NOT use the   |\n\
+        | official channels to report bugs/features, regardless of client.   |\n\
+        | Send usage/configuration questions or feature requests to:         |\n\
+        |   https://github.com/dani-garcia/vaultwarden/discussions or        |\n\
+        |   https://vaultwarden.discourse.group/                             |\n\
+        | Report suspected bugs/issues in the software itself at:            |\n\
+        |   https://github.com/dani-garcia/vaultwarden/issues/new            |\n\
+        \\--------------------------------------------------------------------/\n"
+    );
 }
 
 fn init_logging(level: log::LevelFilter) -> Result<(), fern::InitError> {
@@ -167,14 +246,34 @@ fn init_logging(level: log::LevelFilter) -> Result<(), fern::InitError> {
         log::LevelFilter::Off
     };
 
+    let diesel_logger_level: log::LevelFilter =
+        if cfg!(feature = "query_logger") && std::env::var("QUERY_LOGGER").is_ok() {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Off
+        };
+
+    // Only show Rocket underscore `_` logs when the level is Debug or higher
+    // Else this will bloat the log output with useless messages.
+    let rocket_underscore_level = if level >= log::LevelFilter::Debug {
+        log::LevelFilter::Warn
+    } else {
+        log::LevelFilter::Off
+    };
+
     let mut logger = fern::Dispatch::new()
         .level(level)
         // Hide unknown certificate errors if using self-signed
         .level_for("rustls::session", log::LevelFilter::Off)
         // Hide failed to close stream messages
         .level_for("hyper::server", log::LevelFilter::Warn)
-        // Silence rocket logs
-        .level_for("_", log::LevelFilter::Warn)
+        // Silence Rocket `_` logs
+        .level_for("_", rocket_underscore_level)
+        .level_for("rocket::response::responder::_", rocket_underscore_level)
+        .level_for("rocket::server::_", rocket_underscore_level)
+        .level_for("vaultwarden::api::admin::_", rocket_underscore_level)
+        .level_for("vaultwarden::api::notifications::_", rocket_underscore_level)
+        // Silence Rocket logs
         .level_for("rocket::launch", log::LevelFilter::Error)
         .level_for("rocket::launch_", log::LevelFilter::Error)
         .level_for("rocket::rocket", log::LevelFilter::Warn)
@@ -186,16 +285,18 @@ fn init_logging(level: log::LevelFilter) -> Result<(), fern::InitError> {
         // Prevent cookie_store logs
         .level_for("cookie_store", log::LevelFilter::Off)
         // Variable level for trust-dns used by reqwest
-        .level_for("trust_dns_proto", trust_dns_level)
+        .level_for("trust_dns_resolver::name_server::name_server", trust_dns_level)
+        .level_for("trust_dns_proto::xfer", trust_dns_level)
+        .level_for("diesel_logger", diesel_logger_level)
         .chain(std::io::stdout());
 
     // Enable smtp debug logging only specifically for smtp when need.
     // This can contain sensitive information we do not want in the default debug/trace logging.
     if CONFIG.smtp_debug() {
         println!(
-            "[WARNING] SMTP Debugging is enabled (SMTP_DEBUG=true). Sensitive information could be disclosed via logs!"
+            "[WARNING] SMTP Debugging is enabled (SMTP_DEBUG=true). Sensitive information could be disclosed via logs!\n\
+             [WARNING] Only enable SMTP_DEBUG during troubleshooting!\n"
         );
-        println!("[WARNING] Only enable SMTP_DEBUG during troubleshooting!\n");
         logger = logger.level_for("lettre::transport::smtp", log::LevelFilter::Debug)
     } else {
         logger = logger.level_for("lettre::transport::smtp", log::LevelFilter::Off)
@@ -212,7 +313,7 @@ fn init_logging(level: log::LevelFilter) -> Result<(), fern::InitError> {
             ))
         });
     } else {
-        logger = logger.format(|out, message, _| out.finish(format_args!("{}", message)));
+        logger = logger.format(|out, message, _| out.finish(format_args!("{message}")));
     }
 
     if let Some(log_file) = CONFIG.log_file() {
@@ -241,12 +342,12 @@ fn init_logging(level: log::LevelFilter) -> Result<(), fern::InitError> {
             },
         };
 
-        let backtrace = backtrace::Backtrace::new();
+        let backtrace = std::backtrace::Backtrace::force_capture();
 
         match info.location() {
             Some(location) => {
                 error!(
-                    target: "panic", "thread '{}' panicked at '{}': {}:{}\n{:?}",
+                    target: "panic", "thread '{}' panicked at '{}': {}:{}\n{:}",
                     thread,
                     msg,
                     location.file(),
@@ -256,7 +357,7 @@ fn init_logging(level: log::LevelFilter) -> Result<(), fern::InitError> {
             }
             None => error!(
                 target: "panic",
-                "thread '{}' panicked at '{}'\n{:?}",
+                "thread '{}' panicked at '{}'\n{:}",
                 thread,
                 msg,
                 backtrace
@@ -287,7 +388,7 @@ fn chain_syslog(logger: fern::Dispatch) -> fern::Dispatch {
 
 fn create_dir(path: &str, description: &str) {
     // Try to create the specified dir, if it doesn't already exist.
-    let err_msg = format!("Error creating {} directory '{}'", description, path);
+    let err_msg = format!("Error creating {description} directory '{path}'");
     create_dir_all(path).expect(&err_msg);
 }
 
@@ -301,6 +402,10 @@ async fn check_data_folder() {
         } else {
             error!("Create the data folder and try again.");
         }
+        exit(1);
+    }
+    if !path.is_dir() {
+        error!("Data folder '{}' is not a directory.", data_folder);
         exit(1);
     }
 
@@ -422,11 +527,16 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
         .mount([basepath, "/"].concat(), api::web_routes())
         .mount([basepath, "/api"].concat(), api::core_routes())
         .mount([basepath, "/admin"].concat(), api::admin_routes())
+        .mount([basepath, "/events"].concat(), api::core_events_routes())
         .mount([basepath, "/identity"].concat(), api::identity_routes())
         .mount([basepath, "/icons"].concat(), api::icons_routes())
         .mount([basepath, "/notifications"].concat(), api::notifications_routes())
+        .register([basepath, "/"].concat(), api::web_catchers())
+        .register([basepath, "/api"].concat(), api::core_catchers())
+        .register([basepath, "/admin"].concat(), api::admin_catchers())
         .manage(pool)
         .manage(api::start_notification_server())
+        .manage(Arc::clone(&WS_ANONYMOUS_SUBSCRIPTIONS))
         .attach(util::AppHeaders())
         .attach(util::Cors())
         .attach(util::BetterLogging(extra_debug))
@@ -434,11 +544,12 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
         .await?;
 
     CONFIG.set_rocket_shutdown_handle(instance.shutdown());
-    ctrlc::set_handler(move || {
+
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.expect("Error setting Ctrl-C handler");
         info!("Exiting vaultwarden!");
         CONFIG.shutdown();
-    })
-    .expect("Error setting Ctrl-C handler");
+    });
 
     let _ = instance.launch().await?;
 
@@ -446,7 +557,7 @@ async fn launch_rocket(pool: db::DbPool, extra_debug: bool) -> Result<(), Error>
     Ok(())
 }
 
-async fn schedule_jobs(pool: db::DbPool) {
+fn schedule_jobs(pool: db::DbPool) {
     if CONFIG.job_poll_interval_ms() == 0 {
         info!("Job scheduler disabled.");
         return;
@@ -501,6 +612,22 @@ async fn schedule_jobs(pool: db::DbPool) {
                 }));
             }
 
+            if !CONFIG.auth_request_purge_schedule().is_empty() {
+                sched.add(Job::new(CONFIG.auth_request_purge_schedule().parse().unwrap(), || {
+                    runtime.spawn(purge_auth_requests(pool.clone()));
+                }));
+            }
+
+            // Cleanup the event table of records x days old.
+            if CONFIG.org_events_enabled()
+                && !CONFIG.event_cleanup_schedule().is_empty()
+                && CONFIG.events_days_retain().is_some()
+            {
+                sched.add(Job::new(CONFIG.event_cleanup_schedule().parse().unwrap(), || {
+                    runtime.spawn(api::event_cleanup_job(pool.clone()));
+                }));
+            }
+
             // Periodically check for jobs to run. We probably won't need any
             // jobs that run more often than once a minute, so a default poll
             // interval of 30 seconds should be sufficient. Users who want to
@@ -512,9 +639,7 @@ async fn schedule_jobs(pool: db::DbPool) {
             // tick, the one that was added earlier will run first.
             loop {
                 sched.tick();
-                runtime.block_on(async move {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(CONFIG.job_poll_interval_ms())).await
-                });
+                runtime.block_on(tokio::time::sleep(tokio::time::Duration::from_millis(CONFIG.job_poll_interval_ms())));
             }
         })
         .expect("Error spawning job scheduler thread");

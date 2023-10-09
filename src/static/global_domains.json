@@ -186,6 +186,7 @@
     "Type": 18,
     "Domains": [
       "amazon.com",
+      "amazon.com.be",
       "amazon.ae",
       "amazon.ca",
       "amazon.co.uk",
@@ -937,6 +938,37 @@
       "lieferando.at",
       "thuisbezorgd.nl",
       "pyszne.pl"
+    ],
+    "Excluded": false
+  },
+  {
+    "Type": 89,
+    "Domains": [
+      "atlassian.com",
+      "bitbucket.org",
+      "trello.com",
+      "statuspage.io",
+      "atlassian.net",
+      "jira.com"
+    ],
+    "Excluded": false
+  },
+  {
+    "Type": 90,
+    "Domains": [
+      "pinterest.com",
+      "pinterest.com.au",
+      "pinterest.cl",
+      "pinterest.de",
+      "pinterest.dk",
+      "pinterest.es",
+      "pinterest.fr",
+      "pinterest.co.uk",
+      "pinterest.jp",
+      "pinterest.co.kr",
+      "pinterest.nz",
+      "pinterest.pt",
+      "pinterest.se"
     ],
     "Excluded": false
   }

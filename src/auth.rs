@@ -1,18 +1,14 @@
-//
 // JWT Handling
 //
 use chrono::{Duration, Utc};
 use num_traits::FromPrimitive;
 use once_cell::sync::Lazy;
 
-use jsonwebtoken::{self, Algorithm, DecodingKey, EncodingKey, Header};
+use jsonwebtoken::{self, errors::ErrorKind, Algorithm, DecodingKey, EncodingKey, Header};
 use serde::de::DeserializeOwned;
 use serde::ser::Serialize;
 
-use crate::{
-    error::{Error, MapResult},
-    CONFIG,
-};
+use crate::{error::Error, CONFIG};
 
 const JWT_ALGORITHM: Algorithm = Algorithm::RS256;
 
@@ -27,18 +23,17 @@ static JWT_DELETE_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|delete", CONFI
 static JWT_VERIFYEMAIL_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|verifyemail", CONFIG.domain_origin()));
 static JWT_ADMIN_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|admin", CONFIG.domain_origin()));
 static JWT_SEND_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|send", CONFIG.domain_origin()));
+static JWT_ORG_API_KEY_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|api.organization", CONFIG.domain_origin()));
+static JWT_FILE_DOWNLOAD_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|file_download", CONFIG.domain_origin()));
 
-static PRIVATE_RSA_KEY_VEC: Lazy<Vec<u8>> = Lazy::new(|| {
-    std::fs::read(&CONFIG.private_rsa_key()).unwrap_or_else(|e| panic!("Error loading private RSA Key.\n{}", e))
-});
 static PRIVATE_RSA_KEY: Lazy<EncodingKey> = Lazy::new(|| {
-    EncodingKey::from_rsa_pem(&PRIVATE_RSA_KEY_VEC).unwrap_or_else(|e| panic!("Error decoding private RSA Key.\n{}", e))
-});
-static PUBLIC_RSA_KEY_VEC: Lazy<Vec<u8>> = Lazy::new(|| {
-    std::fs::read(&CONFIG.public_rsa_key()).unwrap_or_else(|e| panic!("Error loading public RSA Key.\n{}", e))
+    let key =
+        std::fs::read(CONFIG.private_rsa_key()).unwrap_or_else(|e| panic!("Error loading private RSA Key. \n{e}"));
+    EncodingKey::from_rsa_pem(&key).unwrap_or_else(|e| panic!("Error decoding private RSA Key.\n{e}"))
 });
 static PUBLIC_RSA_KEY: Lazy<DecodingKey> = Lazy::new(|| {
-    DecodingKey::from_rsa_pem(&PUBLIC_RSA_KEY_VEC).unwrap_or_else(|e| panic!("Error decoding public RSA Key.\n{}", e))
+    let key = std::fs::read(CONFIG.public_rsa_key()).unwrap_or_else(|e| panic!("Error loading public RSA Key. \n{e}"));
+    DecodingKey::from_rsa_pem(&key).unwrap_or_else(|e| panic!("Error decoding public RSA Key.\n{e}"))
 });
 
 pub fn load_keys() {
@@ -49,7 +44,7 @@ pub fn load_keys() {
 pub fn encode_jwt<T: Serialize>(claims: &T) -> String {
     match jsonwebtoken::encode(&JWT_HEADER, claims, &PRIVATE_RSA_KEY) {
         Ok(token) => token,
-        Err(e) => panic!("Error encoding jwt {}", e),
+        Err(e) => panic!("Error encoding jwt {e}"),
     }
 }
 
@@ -61,7 +56,15 @@ fn decode_jwt<T: DeserializeOwned>(token: &str, issuer: String) -> Result<T, Err
     validation.set_issuer(&[issuer]);
 
     let token = token.replace(char::is_whitespace, "");
-    jsonwebtoken::decode(&token, &PUBLIC_RSA_KEY, &validation).map(|d| d.claims).map_res("Error decoding JWT")
+    match jsonwebtoken::decode(&token, &PUBLIC_RSA_KEY, &validation) {
+        Ok(d) => Ok(d.claims),
+        Err(err) => match *err.kind() {
+            ErrorKind::InvalidToken => err!("Token is invalid"),
+            ErrorKind::InvalidIssuer => err!("Issuer is invalid"),
+            ErrorKind::ExpiredSignature => err!("Token has expired"),
+            _ => err!("Error decoding JWT"),
+        },
+    }
 }
 
 pub fn decode_login(token: &str) -> Result<LoginJwtClaims, Error> {
@@ -90,6 +93,14 @@ pub fn decode_admin(token: &str) -> Result<BasicJwtClaims, Error> {
 
 pub fn decode_send(token: &str) -> Result<BasicJwtClaims, Error> {
     decode_jwt(token, JWT_SEND_ISSUER.to_string())
+}
+
+pub fn decode_api_org(token: &str) -> Result<OrgApiKeyLoginJwtClaims, Error> {
+    decode_jwt(token, JWT_ORG_API_KEY_ISSUER.to_string())
+}
+
+pub fn decode_file_download(token: &str) -> Result<FileDownloadClaims, Error> {
+    decode_jwt(token, JWT_FILE_DOWNLOAD_ISSUER.to_string())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -148,9 +159,10 @@ pub fn generate_invite_claims(
     invited_by_email: Option<String>,
 ) -> InviteJwtClaims {
     let time_now = Utc::now().naive_utc();
+    let expire_hours = i64::from(CONFIG.invitation_expiration_hours());
     InviteJwtClaims {
         nbf: time_now.timestamp(),
-        exp: (time_now + Duration::days(5)).timestamp(),
+        exp: (time_now + Duration::hours(expire_hours)).timestamp(),
         iss: JWT_INVITE_ISSUER.to_string(),
         sub: uuid,
         email,
@@ -172,28 +184,83 @@ pub struct EmergencyAccessInviteJwtClaims {
     pub sub: String,
 
     pub email: String,
-    pub emer_id: Option<String>,
-    pub grantor_name: Option<String>,
-    pub grantor_email: Option<String>,
+    pub emer_id: String,
+    pub grantor_name: String,
+    pub grantor_email: String,
 }
 
 pub fn generate_emergency_access_invite_claims(
     uuid: String,
     email: String,
-    emer_id: Option<String>,
-    grantor_name: Option<String>,
-    grantor_email: Option<String>,
+    emer_id: String,
+    grantor_name: String,
+    grantor_email: String,
 ) -> EmergencyAccessInviteJwtClaims {
     let time_now = Utc::now().naive_utc();
+    let expire_hours = i64::from(CONFIG.invitation_expiration_hours());
     EmergencyAccessInviteJwtClaims {
         nbf: time_now.timestamp(),
-        exp: (time_now + Duration::days(5)).timestamp(),
+        exp: (time_now + Duration::hours(expire_hours)).timestamp(),
         iss: JWT_EMERGENCY_ACCESS_INVITE_ISSUER.to_string(),
         sub: uuid,
         email,
         emer_id,
         grantor_name,
         grantor_email,
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OrgApiKeyLoginJwtClaims {
+    // Not before
+    pub nbf: i64,
+    // Expiration time
+    pub exp: i64,
+    // Issuer
+    pub iss: String,
+    // Subject
+    pub sub: String,
+
+    pub client_id: String,
+    pub client_sub: String,
+    pub scope: Vec<String>,
+}
+
+pub fn generate_organization_api_key_login_claims(uuid: String, org_id: String) -> OrgApiKeyLoginJwtClaims {
+    let time_now = Utc::now().naive_utc();
+    OrgApiKeyLoginJwtClaims {
+        nbf: time_now.timestamp(),
+        exp: (time_now + Duration::hours(1)).timestamp(),
+        iss: JWT_ORG_API_KEY_ISSUER.to_string(),
+        sub: uuid,
+        client_id: format!("organization.{org_id}"),
+        client_sub: org_id,
+        scope: vec!["api.organization".into()],
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FileDownloadClaims {
+    // Not before
+    pub nbf: i64,
+    // Expiration time
+    pub exp: i64,
+    // Issuer
+    pub iss: String,
+    // Subject
+    pub sub: String,
+
+    pub file_id: String,
+}
+
+pub fn generate_file_download_claims(uuid: String, file_id: String) -> FileDownloadClaims {
+    let time_now = Utc::now().naive_utc();
+    FileDownloadClaims {
+        nbf: time_now.timestamp(),
+        exp: (time_now + Duration::minutes(5)).timestamp(),
+        iss: JWT_FILE_DOWNLOAD_ISSUER.to_string(),
+        sub: uuid,
+        file_id,
     }
 }
 
@@ -211,9 +278,10 @@ pub struct BasicJwtClaims {
 
 pub fn generate_delete_claims(uuid: String) -> BasicJwtClaims {
     let time_now = Utc::now().naive_utc();
+    let expire_hours = i64::from(CONFIG.invitation_expiration_hours());
     BasicJwtClaims {
         nbf: time_now.timestamp(),
-        exp: (time_now + Duration::days(5)).timestamp(),
+        exp: (time_now + Duration::hours(expire_hours)).timestamp(),
         iss: JWT_DELETE_ISSUER.to_string(),
         sub: uuid,
     }
@@ -221,9 +289,10 @@ pub fn generate_delete_claims(uuid: String) -> BasicJwtClaims {
 
 pub fn generate_verify_email_claims(uuid: String) -> BasicJwtClaims {
     let time_now = Utc::now().naive_utc();
+    let expire_hours = i64::from(CONFIG.invitation_expiration_hours());
     BasicJwtClaims {
         nbf: time_now.timestamp(),
-        exp: (time_now + Duration::days(5)).timestamp(),
+        exp: (time_now + Duration::hours(expire_hours)).timestamp(),
         iss: JWT_VERIFYEMAIL_ISSUER.to_string(),
         sub: uuid,
     }
@@ -233,7 +302,7 @@ pub fn generate_admin_claims() -> BasicJwtClaims {
     let time_now = Utc::now().naive_utc();
     BasicJwtClaims {
         nbf: time_now.timestamp(),
-        exp: (time_now + Duration::minutes(20)).timestamp(),
+        exp: (time_now + Duration::minutes(CONFIG.admin_session_lifetime())).timestamp(),
         iss: JWT_ADMIN_ISSUER.to_string(),
         sub: "admin_panel".to_string(),
     }
@@ -245,7 +314,7 @@ pub fn generate_send_claims(send_id: &str, file_id: &str) -> BasicJwtClaims {
         nbf: time_now.timestamp(),
         exp: (time_now + Duration::minutes(2)).timestamp(),
         iss: JWT_SEND_ISSUER.to_string(),
-        sub: format!("{}/{}", send_id, file_id),
+        sub: format!("{send_id}/{file_id}"),
     }
 }
 
@@ -258,7 +327,7 @@ use rocket::{
 };
 
 use crate::db::{
-    models::{CollectionUser, Device, User, UserOrgStatus, UserOrgType, UserOrganization, UserStampException},
+    models::{Collection, Device, User, UserOrgStatus, UserOrgType, UserOrganization, UserStampException},
     DbConn,
 };
 
@@ -298,7 +367,7 @@ impl<'r> FromRequest<'r> for Host {
                 ""
             };
 
-            format!("{}://{}", protocol, host)
+            format!("{protocol}://{host}")
         };
 
         Outcome::Success(Host {
@@ -307,10 +376,39 @@ impl<'r> FromRequest<'r> for Host {
     }
 }
 
+pub struct ClientHeaders {
+    pub host: String,
+    pub device_type: i32,
+    pub ip: ClientIp,
+}
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for ClientHeaders {
+    type Error = &'static str;
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        let host = try_outcome!(Host::from_request(request).await).host;
+        let ip = match ClientIp::from_request(request).await {
+            Outcome::Success(ip) => ip,
+            _ => err_handler!("Error getting Client IP"),
+        };
+        // When unknown or unable to parse, return 14, which is 'Unknown Browser'
+        let device_type: i32 =
+            request.headers().get_one("device-type").map(|d| d.parse().unwrap_or(14)).unwrap_or_else(|| 14);
+
+        Outcome::Success(ClientHeaders {
+            host,
+            device_type,
+            ip,
+        })
+    }
+}
+
 pub struct Headers {
     pub host: String,
     pub device: Device,
     pub user: User,
+    pub ip: ClientIp,
 }
 
 #[rocket::async_trait]
@@ -321,6 +419,10 @@ impl<'r> FromRequest<'r> for Headers {
         let headers = request.headers();
 
         let host = try_outcome!(Host::from_request(request).await).host;
+        let ip = match ClientIp::from_request(request).await {
+            Outcome::Success(ip) => ip,
+            _ => err_handler!("Error getting Client IP"),
+        };
 
         // Get access_token
         let access_token: &str = match headers.get_one("Authorization") {
@@ -340,17 +442,17 @@ impl<'r> FromRequest<'r> for Headers {
         let device_uuid = claims.device;
         let user_uuid = claims.sub;
 
-        let conn = match DbConn::from_request(request).await {
+        let mut conn = match DbConn::from_request(request).await {
             Outcome::Success(conn) => conn,
             _ => err_handler!("Error getting DB"),
         };
 
-        let device = match Device::find_by_uuid_and_user(&device_uuid, &user_uuid, &conn).await {
+        let device = match Device::find_by_uuid_and_user(&device_uuid, &user_uuid, &mut conn).await {
             Some(device) => device,
             None => err_handler!("Invalid device id"),
         };
 
-        let user = match User::find_by_uuid(&user_uuid, &conn).await {
+        let user = match User::find_by_uuid(&user_uuid, &mut conn).await {
             Some(user) => user,
             None => err_handler!("Device has no user associated"),
         };
@@ -372,7 +474,7 @@ impl<'r> FromRequest<'r> for Headers {
                     // This prevents checking this stamp exception for new requests.
                     let mut user = user;
                     user.reset_stamp_exception();
-                    if let Err(e) = user.save(&conn).await {
+                    if let Err(e) = user.save(&mut conn).await {
                         error!("Error updating user: {:#?}", e);
                     }
                     err_handler!("Stamp exception is expired")
@@ -390,6 +492,7 @@ impl<'r> FromRequest<'r> for Headers {
             host,
             device,
             user,
+            ip,
         })
     }
 }
@@ -401,25 +504,7 @@ pub struct OrgHeaders {
     pub org_user_type: UserOrgType,
     pub org_user: UserOrganization,
     pub org_id: String,
-}
-
-// org_id is usually the second path param ("/organizations/<org_id>"),
-// but there are cases where it is a query value.
-// First check the path, if this is not a valid uuid, try the query values.
-fn get_org_id(request: &Request<'_>) -> Option<String> {
-    if let Some(Ok(org_id)) = request.param::<String>(1) {
-        if uuid::Uuid::parse_str(&org_id).is_ok() {
-            return Some(org_id);
-        }
-    }
-
-    if let Some(Ok(org_id)) = request.query_value::<String>("organizationId") {
-        if uuid::Uuid::parse_str(&org_id).is_ok() {
-            return Some(org_id);
-        }
-    }
-
-    None
+    pub ip: ClientIp,
 }
 
 #[rocket::async_trait]
@@ -428,15 +513,36 @@ impl<'r> FromRequest<'r> for OrgHeaders {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let headers = try_outcome!(Headers::from_request(request).await);
-        match get_org_id(request) {
+
+        // org_id is usually the second path param ("/organizations/<org_id>"),
+        // but there are cases where it is a query value.
+        // First check the path, if this is not a valid uuid, try the query values.
+        let url_org_id: Option<&str> = {
+            let mut url_org_id = None;
+            if let Some(Ok(org_id)) = request.param::<&str>(1) {
+                if uuid::Uuid::parse_str(org_id).is_ok() {
+                    url_org_id = Some(org_id);
+                }
+            }
+
+            if let Some(Ok(org_id)) = request.query_value::<&str>("organizationId") {
+                if uuid::Uuid::parse_str(org_id).is_ok() {
+                    url_org_id = Some(org_id);
+                }
+            }
+
+            url_org_id
+        };
+
+        match url_org_id {
             Some(org_id) => {
-                let conn = match DbConn::from_request(request).await {
+                let mut conn = match DbConn::from_request(request).await {
                     Outcome::Success(conn) => conn,
                     _ => err_handler!("Error getting DB"),
                 };
 
                 let user = headers.user;
-                let org_user = match UserOrganization::find_by_user_and_org(&user.uuid, &org_id, &conn).await {
+                let org_user = match UserOrganization::find_by_user_and_org(&user.uuid, org_id, &mut conn).await {
                     Some(user) => {
                         if user.status == UserOrgStatus::Confirmed as i32 {
                             user
@@ -460,7 +566,8 @@ impl<'r> FromRequest<'r> for OrgHeaders {
                         }
                     },
                     org_user,
-                    org_id,
+                    org_id: String::from(org_id),
+                    ip: headers.ip,
                 })
             }
             _ => err_handler!("Error getting the organization id"),
@@ -473,6 +580,8 @@ pub struct AdminHeaders {
     pub device: Device,
     pub user: User,
     pub org_user_type: UserOrgType,
+    pub client_version: Option<String>,
+    pub ip: ClientIp,
 }
 
 #[rocket::async_trait]
@@ -481,12 +590,15 @@ impl<'r> FromRequest<'r> for AdminHeaders {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let headers = try_outcome!(OrgHeaders::from_request(request).await);
+        let client_version = request.headers().get_one("Bitwarden-Client-Version").map(String::from);
         if headers.org_user_type >= UserOrgType::Admin {
             Outcome::Success(Self {
                 host: headers.host,
                 device: headers.device,
                 user: headers.user,
                 org_user_type: headers.org_user_type,
+                client_version,
+                ip: headers.ip,
             })
         } else {
             err_handler!("You need to be Admin or Owner to call this endpoint")
@@ -500,6 +612,7 @@ impl From<AdminHeaders> for Headers {
             host: h.host,
             device: h.device,
             user: h.user,
+            ip: h.ip,
         }
     }
 }
@@ -531,6 +644,7 @@ pub struct ManagerHeaders {
     pub device: Device,
     pub user: User,
     pub org_user_type: UserOrgType,
+    pub ip: ClientIp,
 }
 
 #[rocket::async_trait]
@@ -542,18 +656,13 @@ impl<'r> FromRequest<'r> for ManagerHeaders {
         if headers.org_user_type >= UserOrgType::Manager {
             match get_col_id(request) {
                 Some(col_id) => {
-                    let conn = match DbConn::from_request(request).await {
+                    let mut conn = match DbConn::from_request(request).await {
                         Outcome::Success(conn) => conn,
                         _ => err_handler!("Error getting DB"),
                     };
 
-                    if !headers.org_user.has_full_access() {
-                        match CollectionUser::find_by_collection_and_user(&col_id, &headers.org_user.user_uuid, &conn)
-                            .await
-                        {
-                            Some(_) => (),
-                            None => err_handler!("The current user isn't a manager for this collection"),
-                        }
+                    if !can_access_collection(&headers.org_user, &col_id, &mut conn).await {
+                        err_handler!("The current user isn't a manager for this collection")
                     }
                 }
                 _ => err_handler!("Error getting the collection id"),
@@ -564,6 +673,7 @@ impl<'r> FromRequest<'r> for ManagerHeaders {
                 device: headers.device,
                 user: headers.user,
                 org_user_type: headers.org_user_type,
+                ip: headers.ip,
             })
         } else {
             err_handler!("You need to be a Manager, Admin or Owner to call this endpoint")
@@ -577,6 +687,7 @@ impl From<ManagerHeaders> for Headers {
             host: h.host,
             device: h.device,
             user: h.user,
+            ip: h.ip,
         }
     }
 }
@@ -587,7 +698,9 @@ pub struct ManagerHeadersLoose {
     pub host: String,
     pub device: Device,
     pub user: User,
+    pub org_user: UserOrganization,
     pub org_user_type: UserOrgType,
+    pub ip: ClientIp,
 }
 
 #[rocket::async_trait]
@@ -601,7 +714,9 @@ impl<'r> FromRequest<'r> for ManagerHeadersLoose {
                 host: headers.host,
                 device: headers.device,
                 user: headers.user,
+                org_user: headers.org_user,
                 org_user_type: headers.org_user_type,
+                ip: headers.ip,
             })
         } else {
             err_handler!("You need to be a Manager, Admin or Owner to call this endpoint")
@@ -615,7 +730,37 @@ impl From<ManagerHeadersLoose> for Headers {
             host: h.host,
             device: h.device,
             user: h.user,
+            ip: h.ip,
         }
+    }
+}
+async fn can_access_collection(org_user: &UserOrganization, col_id: &str, conn: &mut DbConn) -> bool {
+    org_user.has_full_access()
+        || Collection::has_access_by_collection_and_user_uuid(col_id, &org_user.user_uuid, conn).await
+}
+
+impl ManagerHeaders {
+    pub async fn from_loose(
+        h: ManagerHeadersLoose,
+        collections: &Vec<String>,
+        conn: &mut DbConn,
+    ) -> Result<ManagerHeaders, Error> {
+        for col_id in collections {
+            if uuid::Uuid::parse_str(col_id).is_err() {
+                err!("Collection Id is malformed!");
+            }
+            if !can_access_collection(&h.org_user, col_id, conn).await {
+                err!("You don't have access to all collections!");
+            }
+        }
+
+        Ok(ManagerHeaders {
+            host: h.host,
+            device: h.device,
+            user: h.user,
+            org_user_type: h.org_user_type,
+            ip: h.ip,
+        })
     }
 }
 
@@ -623,6 +768,7 @@ pub struct OwnerHeaders {
     pub host: String,
     pub device: Device,
     pub user: User,
+    pub ip: ClientIp,
 }
 
 #[rocket::async_trait]
@@ -636,6 +782,7 @@ impl<'r> FromRequest<'r> for OwnerHeaders {
                 host: headers.host,
                 device: headers.device,
                 user: headers.user,
+                ip: headers.ip,
             })
         } else {
             err_handler!("You need to be Owner to call this endpoint")
@@ -675,6 +822,29 @@ impl<'r> FromRequest<'r> for ClientIp {
 
         Outcome::Success(ClientIp {
             ip,
+        })
+    }
+}
+
+pub struct WsAccessTokenHeader {
+    pub access_token: Option<String>,
+}
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for WsAccessTokenHeader {
+    type Error = ();
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        let headers = request.headers();
+
+        // Get access_token
+        let access_token = match headers.get_one("Authorization") {
+            Some(a) => a.rsplit("Bearer ").next().map(String::from),
+            None => None,
+        };
+
+        Outcome::Success(Self {
+            access_token,
         })
     }
 }
