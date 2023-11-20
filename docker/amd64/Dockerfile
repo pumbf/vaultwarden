@@ -24,7 +24,7 @@
 #     [docker.io/vaultwarden/web-vault:v2023.8.2]
 #
 
-FROM pumbf.cn/bw-web:v2023.9.1 as vault
+FROM pumbf.cn/bw-web:v2023.10.0 as vault
 
 ########################## BUILD IMAGE  ##########################
 FROM docker.io/library/rust:1.72.0-bookworm as build
